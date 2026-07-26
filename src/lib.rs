@@ -620,15 +620,11 @@ impl CoreBPE {
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let regex = Regex::new(pattern)?;
-
-        let special_regex = {
-            let parts = special_tokens_encoder
-                .keys()
-                .map(|s| fancy_regex::escape(s))
-                .collect::<Vec<_>>();
-            Regex::new(&parts.join("|"))?
-        };
+        let special_pattern = special_tokens_encoder
+            .keys()
+            .map(|s| fancy_regex::escape(s))
+            .collect::<Vec<_>>()
+            .join("|");
 
         let decoder: HashMap<Rank, Vec<u8>> =
             encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
@@ -649,15 +645,26 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
+        // Compile a fully independent regex for each thread-local slot instead of cloning.
+        // Cloning a `fancy_regex::Regex` shares its inner `Arc<Prog>`, and that program holds the
+        // delegated `regex` engines (each with its own thread-safe scratch `Pool`). Sharing those
+        // across threads causes lock contention on the pool (`Pool::get_slow`/`put_value`) under
+        // multi-threaded batch encoding. Re-compiling from the pattern gives every slot its own
+        // program and pools, so concurrent threads never contend.
+        let regex_tls = (0..MAX_NUM_THREADS)
+            .map(|_| Regex::new(pattern))
+            .collect::<Result<Vec<_>, _>>()?;
+        let special_regex_tls = (0..MAX_NUM_THREADS)
+            .map(|_| Regex::new(&special_pattern))
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Self {
             encoder,
             special_tokens_encoder,
             decoder,
             special_tokens_decoder,
-            regex_tls: (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect(),
-            special_regex_tls: (0..MAX_NUM_THREADS)
-                .map(|_| special_regex.clone())
-                .collect(),
+            regex_tls,
+            special_regex_tls,
             sorted_token_bytes,
         })
     }
