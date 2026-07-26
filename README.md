@@ -1,5 +1,7 @@
 # ⏳ tiktoken
 
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/AvalancheHQ/tiktoken?utm_source=badge)
+
 tiktoken is a fast [BPE](https://en.wikipedia.org/wiki/Byte_pair_encoding) tokeniser for use with
 OpenAI's models.
 
