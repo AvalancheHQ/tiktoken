@@ -154,7 +154,27 @@ impl CoreBPE {
     // ====================
 
     #[pyo3(name = "decode_bytes")]
-    fn py_decode_bytes(&self, py: Python, tokens: Vec<Rank>) -> Result<Py<PyBytes>, PyErr> {
+    fn py_decode_bytes(&self, py: Python, tokens: &Bound<'_, PyAny>) -> Result<Py<PyBytes>, PyErr> {
+        // Taking the argument as `Vec<Rank>` makes pyo3 unmarshal the Python
+        // list through its generic sequence extraction, which drives the Python
+        // iterator protocol (`PyIterator::next`) once per element. On large
+        // token lists this argument conversion — not the actual byte copying in
+        // `decode_bytes` — dominates decode time.
+        //
+        // When the argument is a concrete `list`, read it with the `PyList`
+        // iterator (which indexes elements directly, without the iterator
+        // protocol object) into a right-sized buffer. Anything else falls back
+        // to the original generic extraction so behavior is unchanged.
+        let tokens: Vec<Rank> = match tokens.downcast::<PyList>() {
+            Ok(list) => {
+                let mut out = Vec::with_capacity(list.len());
+                for item in list.iter() {
+                    out.push(item.extract::<Rank>()?);
+                }
+                out
+            }
+            Err(_) => tokens.extract()?,
+        };
         match py.detach(|| self.decode_bytes(&tokens)) {
             Ok(bytes) => Ok(PyBytes::new(py, &bytes).into()),
             Err(e) => Err(pyo3::exceptions::PyKeyError::new_err(format!("{}", e))),
