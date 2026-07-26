@@ -8,7 +8,7 @@ use pyo3::{
 };
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::{CoreBPE, Rank, byte_pair_encode};
+use crate::{CoreBPE, DecodeKeyError, Rank, byte_pair_encode};
 
 #[pymethods]
 impl CoreBPE {
@@ -163,18 +163,34 @@ impl CoreBPE {
         //
         // When the argument is a concrete `list`, read it with the `PyList`
         // iterator (which indexes elements directly, without the iterator
-        // protocol object) into a right-sized buffer. Anything else falls back
-        // to the original generic extraction so behavior is unchanged.
-        let tokens: Vec<Rank> = match tokens.downcast::<PyList>() {
-            Ok(list) => {
-                let mut out = Vec::with_capacity(list.len());
-                for item in list.iter() {
-                    out.push(item.extract::<Rank>()?);
-                }
-                out
+        // protocol object). We fuse the token extraction with the byte lookup:
+        // each token is read once and its bytes appended straight to the output
+        // buffer. This avoids materialising an intermediate `Vec<Rank>` (a
+        // separate allocation plus a second full traversal of every token in
+        // `decode_bytes`), which profiling showed to be a large, memory-bound
+        // part of decode. Anything that is not a concrete `list` falls back to
+        // the original generic extraction so behavior is unchanged.
+        if let Ok(list) = tokens.downcast::<PyList>() {
+            let mut ret: Vec<u8> = Vec::with_capacity(list.len() * 4);
+            for item in list.iter() {
+                let token = item.extract::<Rank>()?;
+                let token_bytes = match self.decoder.get(&token) {
+                    Some(bytes) => bytes,
+                    None => match self.special_tokens_decoder.get(&token) {
+                        Some(bytes) => bytes,
+                        None => {
+                            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                                "{}",
+                                DecodeKeyError { token }
+                            )));
+                        }
+                    },
+                };
+                ret.extend_from_slice(token_bytes);
             }
-            Err(_) => tokens.extract()?,
-        };
+            return Ok(PyBytes::new(py, &ret).into());
+        }
+        let tokens: Vec<Rank> = tokens.extract()?;
         match py.detach(|| self.decode_bytes(&tokens)) {
             Ok(bytes) => Ok(PyBytes::new(py, &bytes).into()),
             Err(e) => Err(pyo3::exceptions::PyKeyError::new_err(format!("{}", e))),
