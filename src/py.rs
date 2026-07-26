@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::os::raw::c_ulong;
 
 use pyo3::{
     IntoPyObjectExt, PyResult, exceptions,
@@ -169,6 +170,27 @@ impl CoreBPE {
             Ok(list) => {
                 let mut out = Vec::with_capacity(list.len());
                 for item in list.iter() {
+                    // `Bound::extract::<u32>` goes through PyO3's generic
+                    // `FromPyObject` machinery, which dominates decode time on large
+                    // token lists. For the overwhelmingly common case of a plain
+                    // `int` that fits in a `u32`, call the CPython C-API directly:
+                    // `PyLong_AsUnsignedLong` returns the value with a single fast
+                    // conversion. Anything that doesn't take that path (non-int,
+                    // out-of-range, negative, ...) falls back to `extract`, which
+                    // reproduces the original error and behaviour exactly.
+                    // SAFETY: `item` is a live, borrowed Python object and the GIL is
+                    // held for the duration of the call.
+                    let value = unsafe { pyo3::ffi::PyLong_AsUnsignedLong(item.as_ptr()) };
+                    if value != c_ulong::MAX || unsafe { pyo3::ffi::PyErr_Occurred() }.is_null() {
+                        if let Ok(token) = Rank::try_from(value) {
+                            out.push(token);
+                            continue;
+                        }
+                    } else {
+                        // Clear the error set by PyLong_AsUnsignedLong so the
+                        // fallback `extract` can report the correct error itself.
+                        unsafe { pyo3::ffi::PyErr_Clear() };
+                    }
                     out.push(item.extract::<Rank>()?);
                 }
                 out
