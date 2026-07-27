@@ -161,20 +161,48 @@ impl CoreBPE {
         // token lists this argument conversion — not the actual byte copying in
         // `decode_bytes` — dominates decode time.
         //
-        // When the argument is a concrete `list`, read it with the `PyList`
-        // iterator (which indexes elements directly, without the iterator
-        // protocol object) into a right-sized buffer. Anything else falls back
-        // to the original generic extraction so behavior is unchanged.
-        let tokens: Vec<Rank> = match tokens.downcast::<PyList>() {
-            Ok(list) => {
-                let mut out = Vec::with_capacity(list.len());
-                for item in list.iter() {
-                    out.push(item.extract::<Rank>()?);
-                }
-                out
+        // Fast path: when the argument is a concrete `list`, resolve every
+        // token to its byte slice once, then write those bytes straight into
+        // the Python `bytes` object's final buffer via `PyBytes::new_with`.
+        //
+        // The generic path allocates and fills an intermediate `Vec<u8>` inside
+        // `decode_bytes` and then copies that whole `Vec` again into a freshly
+        // allocated `bytes` object. Here we instead pre-compute the exact output
+        // length and let `new_with` allocate the `bytes` object directly, so the
+        // decoded bytes are copied exactly once — into their final destination —
+        // with no intermediate heap buffer. Anything that is not a concrete
+        // `list` falls back to the original path so behavior is unchanged.
+        if let Ok(list) = tokens.downcast::<PyList>() {
+            let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
+            let mut total_len = 0usize;
+            for item in list.iter() {
+                let token = item.extract::<Rank>()?;
+                let token_bytes = match self.decoder.get(&token) {
+                    Some(bytes) => bytes,
+                    None => match self.special_tokens_decoder.get(&token) {
+                        Some(bytes) => bytes,
+                        None => {
+                            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                                "{}",
+                                crate::DecodeKeyError { token }
+                            )));
+                        }
+                    },
+                };
+                total_len += token_bytes.len();
+                slices.push(token_bytes.as_slice());
             }
-            Err(_) => tokens.extract()?,
-        };
+            return PyBytes::new_with(py, total_len, |buf| {
+                let mut offset = 0;
+                for s in &slices {
+                    buf[offset..offset + s.len()].copy_from_slice(s);
+                    offset += s.len();
+                }
+                Ok(())
+            })
+            .map(Into::into);
+        }
+        let tokens: Vec<Rank> = tokens.extract()?;
         match py.detach(|| self.decode_bytes(&tokens)) {
             Ok(bytes) => Ok(PyBytes::new(py, &bytes).into()),
             Err(e) => Err(pyo3::exceptions::PyKeyError::new_err(format!("{}", e))),
