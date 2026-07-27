@@ -645,15 +645,11 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
-        // Compile a fully independent regex for each thread-local slot rather than compiling once
-        // and cloning. `Clone` on a `fancy_regex::Regex` only bumps the refcount of a shared
-        // `Arc<Prog>`, and that program owns the delegated `regex`/`regex-automata` engines whose
-        // scratch space lives in a single mutex-guarded `Pool`. Cloned slots therefore all point at
-        // the *same* pool, so multi-threaded batch encoding (GIL released, one slot per thread)
-        // contends on the pool's slow path (`Pool::get_slow` / `Pool::put_value`). Recompiling per
-        // slot gives every thread its own program and pool, so concurrent threads take the
-        // lock-free fast path and never contend. The extra compile cost is paid once, at
-        // construction, never on the hot encode path.
+        // Compile an independent regex per thread-local slot instead of cloning one. Cloning a
+        // `fancy_regex::Regex` shares an `Arc<Prog>` whose regex-automata engines keep their scratch
+        // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
+        // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
+        // lock-free path), paying the compile cost once at construction rather than on the hot path.
         let regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(pattern))
             .collect::<Result<Vec<_>, _>>()?;
