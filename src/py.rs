@@ -155,26 +155,60 @@ impl CoreBPE {
 
     #[pyo3(name = "decode_bytes")]
     fn py_decode_bytes(&self, py: Python, tokens: &Bound<'_, PyAny>) -> Result<Py<PyBytes>, PyErr> {
-        // Taking the argument as `Vec<Rank>` makes pyo3 unmarshal the Python
-        // list through its generic sequence extraction, which drives the Python
-        // iterator protocol (`PyIterator::next`) once per element. On large
-        // token lists this argument conversion — not the actual byte copying in
-        // `decode_bytes` — dominates decode time.
+        // Decode is dominated by two costs that the profile makes clear on the
+        // large-token benchmarks:
+        //   1. reading every Python `int` token out of the list, and
+        //   2. copying the decoded bytes around.
         //
-        // When the argument is a concrete `list`, read it with the `PyList`
-        // iterator (which indexes elements directly, without the iterator
-        // protocol object) into a right-sized buffer. Anything else falls back
-        // to the original generic extraction so behavior is unchanged.
-        let tokens: Vec<Rank> = match tokens.downcast::<PyList>() {
-            Ok(list) => {
-                let mut out = Vec::with_capacity(list.len());
-                for item in list.iter() {
-                    out.push(item.extract::<Rank>()?);
-                }
-                out
+        // For the common case where `tokens` is a concrete `list`, do both in a
+        // single fused pass with no intermediate `Vec<Rank>` and no intermediate
+        // `Vec<u8>`:
+        //   * read each token with the CPython C-API (`PyLong_AsUnsignedLong`),
+        //     which avoids pyo3's generic `FromPyObject::<u32>::extract`
+        //     machinery (per-element type dispatch + error scaffolding),
+        //   * resolve each token to its decoder byte slice immediately, and
+        //   * write those bytes straight into the destination Python `bytes`
+        //     object via `PyBytes::new_with`, so the decoded bytes are copied
+        //     exactly once, into their final buffer.
+        //
+        // Anything that is not a plain in-range `int` (negative, out of range,
+        // the `ULONG_MAX` error sentinel, or a non-int) clears the pending
+        // error and falls back to the generic `extract`, so token error
+        // behaviour (`OverflowError` / `TypeError`) is exactly preserved. A
+        // token that is not a known id still raises `KeyError` identically.
+        if let Ok(list) = tokens.downcast::<PyList>() {
+            // First pass: resolve every token to its byte slice and total length.
+            let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
+            let mut total_len = 0usize;
+            for item in list.iter() {
+                let token = read_rank(&item)?;
+                let token_bytes = match self.decoder.get(&token) {
+                    Some(bytes) => bytes.as_slice(),
+                    None => match self.special_tokens_decoder.get(&token) {
+                        Some(bytes) => bytes.as_slice(),
+                        None => {
+                            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                                "Invalid token for decoding: {token}"
+                            )));
+                        }
+                    },
+                };
+                total_len += token_bytes.len();
+                slices.push(token_bytes);
             }
-            Err(_) => tokens.extract()?,
-        };
+            // Second pass: write the bytes directly into the final buffer.
+            let bytes = PyBytes::new_with(py, total_len, |mut buf| {
+                for s in &slices {
+                    buf[..s.len()].copy_from_slice(s);
+                    buf = &mut buf[s.len()..];
+                }
+                Ok(())
+            })?;
+            return Ok(bytes.into());
+        }
+
+        // Non-`list` inputs keep the original generic extraction path.
+        let tokens: Vec<Rank> = tokens.extract()?;
         match py.detach(|| self.decode_bytes(&tokens)) {
             Ok(bytes) => Ok(PyBytes::new(py, &bytes).into()),
             Err(e) => Err(pyo3::exceptions::PyKeyError::new_err(format!("{}", e))),
@@ -201,6 +235,36 @@ impl CoreBPE {
             .map(|x| PyBytes::new(py, x).into())
             .collect()
     }
+}
+
+/// Read a token id from a Python object.
+///
+/// The common case — a plain `int` that fits in a `u32` — is read with a single
+/// direct CPython C-API call (`PyLong_AsUnsignedLong`), avoiding pyo3's generic
+/// `FromPyObject::<u32>::extract` machinery. Anything that does not fit that
+/// fast path (non-int, negative, out of range, or the ambiguous `ULONG_MAX`
+/// error sentinel) clears any pending error and falls back to the generic
+/// `extract`, so the resulting error type is exactly what it was before.
+#[inline]
+fn read_rank(item: &Bound<'_, PyAny>) -> PyResult<Rank> {
+    // SAFETY: `item` is a valid, non-null borrowed Python object for the
+    // duration of the call, and we hold the GIL (we have a `Bound`).
+    let value = unsafe { pyo3::ffi::PyLong_AsUnsignedLong(item.as_ptr()) };
+    // `PyLong_AsUnsignedLong` returns `(c_ulong)-1` and sets an exception on
+    // any error (not an int, negative, or too large). It can also legitimately
+    // return that value for the in-range integer `c_ulong::MAX`; in that case
+    // no error is set. Treat the sentinel as "needs the slow path" either way.
+    if value != std::os::raw::c_ulong::MAX
+        && let Ok(rank) = Rank::try_from(value)
+    {
+        return Ok(rank);
+    }
+    // Clear any pending error from the fast path and fall back to the generic
+    // extraction, which produces the original error types (`OverflowError` for
+    // negative / out-of-range, `TypeError` for non-int) and handles the exact
+    // `c_ulong::MAX` value correctly.
+    unsafe { pyo3::ffi::PyErr_Clear() };
+    item.extract::<Rank>()
 }
 
 #[pyclass(frozen)]
