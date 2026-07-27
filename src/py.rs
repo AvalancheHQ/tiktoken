@@ -181,14 +181,29 @@ impl CoreBPE {
                 slices.push(token_bytes);
             }
             // Copy the resolved bytes directly into the final buffer.
-            let bytes = PyBytes::new_with(py, total_len, |mut buf| {
+            //
+            // We allocate the destination `bytes` object with the CPython C-API
+            // directly instead of `PyBytes::new_with`. `new_with` zero-fills the
+            // whole buffer before handing it to us (`ptr::write_bytes(buf, 0,
+            // len)`), but we then overwrite every one of those bytes with the
+            // decoded content, so that memset is pure redundant work — it showed
+            // up as a measurable, memory-bound `memset` in the decode profile.
+            // Writing into the fresh (uninitialised) buffer exactly once removes
+            // it. This is sound because we write precisely `total_len` bytes,
+            // fully covering the buffer, before the object is observed.
+            unsafe {
+                let pyptr =
+                    pyo3::ffi::PyBytes_FromStringAndSize(std::ptr::null(), total_len as isize);
+                let bytes: Bound<'_, PyBytes> =
+                    Bound::from_owned_ptr_or_err(py, pyptr)?.cast_into_unchecked();
+                let mut buf: *mut u8 = pyo3::ffi::PyBytes_AsString(pyptr).cast();
+                debug_assert!(!buf.is_null());
                 for s in &slices {
-                    buf[..s.len()].copy_from_slice(s);
-                    buf = &mut buf[s.len()..];
+                    std::ptr::copy_nonoverlapping(s.as_ptr(), buf, s.len());
+                    buf = buf.add(s.len());
                 }
-                Ok(())
-            })?;
-            return Ok(bytes.into());
+                return Ok(bytes.into());
+            }
         }
 
         // Non-`list` inputs keep the original generic extraction path.
