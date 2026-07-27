@@ -620,15 +620,11 @@ impl CoreBPE {
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let regex = Regex::new(pattern)?;
-
-        let special_regex = {
-            let parts = special_tokens_encoder
-                .keys()
-                .map(|s| fancy_regex::escape(s))
-                .collect::<Vec<_>>();
-            Regex::new(&parts.join("|"))?
-        };
+        let special_pattern = special_tokens_encoder
+            .keys()
+            .map(|s| fancy_regex::escape(s))
+            .collect::<Vec<_>>()
+            .join("|");
 
         let decoder: HashMap<Rank, Vec<u8>> =
             encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
@@ -649,15 +645,29 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
+        // Compile a fully independent regex for each thread-local slot rather than compiling once
+        // and cloning. `Clone` on a `fancy_regex::Regex` only bumps the refcount of a shared
+        // `Arc<Prog>`, and that program owns the delegated `regex`/`regex-automata` engines whose
+        // scratch space lives in a single mutex-guarded `Pool`. Cloned slots therefore all point at
+        // the *same* pool, so multi-threaded batch encoding (GIL released, one slot per thread)
+        // contends on the pool's slow path (`Pool::get_slow` / `Pool::put_value`). Recompiling per
+        // slot gives every thread its own program and pool, so concurrent threads take the
+        // lock-free fast path and never contend. The extra compile cost is paid once, at
+        // construction, never on the hot encode path.
+        let regex_tls = (0..MAX_NUM_THREADS)
+            .map(|_| Regex::new(pattern))
+            .collect::<Result<Vec<_>, _>>()?;
+        let special_regex_tls = (0..MAX_NUM_THREADS)
+            .map(|_| Regex::new(&special_pattern))
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Self {
             encoder,
             special_tokens_encoder,
             decoder,
             special_tokens_decoder,
-            regex_tls: (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect(),
-            special_regex_tls: (0..MAX_NUM_THREADS)
-                .map(|_| special_regex.clone())
-                .collect(),
+            regex_tls,
+            special_regex_tls,
             sorted_token_bytes,
         })
     }
