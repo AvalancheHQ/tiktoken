@@ -620,15 +620,11 @@ impl CoreBPE {
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let regex = Regex::new(pattern)?;
-
-        let special_regex = {
-            let parts = special_tokens_encoder
-                .keys()
-                .map(|s| fancy_regex::escape(s))
-                .collect::<Vec<_>>();
-            Regex::new(&parts.join("|"))?
-        };
+        let special_pattern = special_tokens_encoder
+            .keys()
+            .map(|s| fancy_regex::escape(s))
+            .collect::<Vec<_>>()
+            .join("|");
 
         let decoder: HashMap<Rank, Vec<u8>> =
             encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
@@ -649,15 +645,25 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
+        // Compile an independent regex per thread-local slot instead of cloning one. Cloning a
+        // `fancy_regex::Regex` shares an `Arc<Prog>` whose regex-automata engines keep their scratch
+        // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
+        // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
+        // lock-free path), paying the compile cost once at construction rather than on the hot path.
+        let regex_tls = (0..MAX_NUM_THREADS)
+            .map(|_| Regex::new(pattern))
+            .collect::<Result<Vec<_>, _>>()?;
+        let special_regex_tls = (0..MAX_NUM_THREADS)
+            .map(|_| Regex::new(&special_pattern))
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Self {
             encoder,
             special_tokens_encoder,
             decoder,
             special_tokens_decoder,
-            regex_tls: (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect(),
-            special_regex_tls: (0..MAX_NUM_THREADS)
-                .map(|_| special_regex.clone())
-                .collect(),
+            regex_tls,
+            special_regex_tls,
             sorted_token_bytes,
         })
     }
