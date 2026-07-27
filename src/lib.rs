@@ -322,6 +322,13 @@ pub struct CoreBPE {
     special_tokens_encoder: HashMap<String, Rank>,
     decoder: HashMap<Rank, Vec<u8>>,
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
+    // Flat, rank-indexed view of every token's bytes (regular + special). Token
+    // ranks are dense (`0..=max_rank`), so decoding can resolve a token with a
+    // single bounds-checked slice index instead of hashing into `decoder` and
+    // then falling back to `special_tokens_decoder`. `decode` is the hottest
+    // consumer of this and is dominated by per-token lookups, so replacing the
+    // hash lookup with a direct index is a measurable win.
+    decoder_flat: Vec<Vec<u8>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
@@ -346,10 +353,14 @@ impl CoreBPE {
     /// every decode path (both the pure-Rust `decode_bytes` and the fused
     /// Python `list` fast path in `py.rs`), so they cannot diverge.
     pub(crate) fn token_bytes(&self, token: Rank) -> Option<&[u8]> {
-        self.decoder
-            .get(&token)
-            .or_else(|| self.special_tokens_decoder.get(&token))
-            .map(Vec::as_slice)
+        // Ranks are dense, so `decoder_flat` covers every valid token with a
+        // direct index. Empty entries mark ranks with no token (there should be
+        // none for well-formed vocabularies, but we stay defensive), which we
+        // treat as a miss.
+        match self.decoder_flat.get(token as usize) {
+            Some(bytes) if !bytes.is_empty() => Some(bytes.as_slice()),
+            _ => None,
+        }
     }
 
     /// Decodes tokens into a list of bytes.
@@ -648,6 +659,26 @@ impl CoreBPE {
             .map(|(k, v)| (*v, k.as_bytes().to_vec()))
             .collect();
 
+        // Build a flat, rank-indexed decode table. Token ranks are dense, so
+        // this lets the decode hot path resolve a token with a single indexed
+        // slice lookup instead of two hash lookups. Empty slots correspond to
+        // ranks with no token (none for well-formed vocabularies).
+        let max_rank = decoder
+            .keys()
+            .chain(special_tokens_decoder.keys())
+            .copied()
+            .max();
+        let decoder_flat: Vec<Vec<u8>> = match max_rank {
+            Some(max_rank) => {
+                let mut flat = vec![Vec::new(); max_rank as usize + 1];
+                for (&rank, bytes) in decoder.iter().chain(special_tokens_decoder.iter()) {
+                    flat[rank as usize] = bytes.clone();
+                }
+                flat
+            }
+            None => Vec::new(),
+        };
+
         // Clone because I don't know how to tell Rust I'm not going to change the map
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
@@ -669,6 +700,7 @@ impl CoreBPE {
             special_tokens_encoder,
             decoder,
             special_tokens_decoder,
+            decoder_flat,
             regex_tls,
             special_regex_tls,
             sorted_token_bytes,
