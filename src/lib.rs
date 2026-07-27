@@ -322,6 +322,16 @@ pub struct CoreBPE {
     special_tokens_encoder: HashMap<String, Rank>,
     decoder: HashMap<Rank, Vec<u8>>,
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
+    // Contiguous, rank-indexed view of every token's bytes (regular + special).
+    // Token ranks are dense (`0..=max_rank`), so decoding can resolve a token
+    // with a single bounds-checked index into `decoder_spans` plus a slice into
+    // one shared `decoder_arena` buffer, instead of hashing into `decoder` and
+    // falling back to `special_tokens_decoder`. Storing the bytes back-to-back
+    // in a single allocation (rather than one `Vec<u8>` per token) keeps the
+    // decode hot path free of per-token pointer chasing and improves cache
+    // locality, which matters because `decode` is dominated by these lookups.
+    decoder_arena: Vec<u8>,
+    decoder_spans: Vec<(u32, u32)>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
@@ -346,10 +356,16 @@ impl CoreBPE {
     /// every decode path (both the pure-Rust `decode_bytes` and the fused
     /// Python `list` fast path in `py.rs`), so they cannot diverge.
     pub(crate) fn token_bytes(&self, token: Rank) -> Option<&[u8]> {
-        self.decoder
-            .get(&token)
-            .or_else(|| self.special_tokens_decoder.get(&token))
-            .map(Vec::as_slice)
+        // Ranks are dense, so `decoder_spans` covers every valid token with a
+        // direct index into the shared `decoder_arena`. An empty span (start ==
+        // end) marks a rank with no token (there should be none for well-formed
+        // vocabularies, but we stay defensive) and is treated as a miss so the
+        // same `KeyError` is raised as before.
+        let &(start, end) = self.decoder_spans.get(token as usize)?;
+        if start == end {
+            return None;
+        }
+        Some(&self.decoder_arena[start as usize..end as usize])
     }
 
     /// Decodes tokens into a list of bytes.
@@ -648,6 +664,35 @@ impl CoreBPE {
             .map(|(k, v)| (*v, k.as_bytes().to_vec()))
             .collect();
 
+        // Build a contiguous, rank-indexed decode table. Token ranks are dense,
+        // so this lets the decode hot path resolve a token with a single indexed
+        // span lookup and a slice into one shared arena, instead of two hash
+        // lookups and a per-token pointer chase. Empty spans correspond to ranks
+        // with no token (none for well-formed vocabularies).
+        let max_rank = decoder
+            .keys()
+            .chain(special_tokens_decoder.keys())
+            .copied()
+            .max();
+        let (decoder_arena, decoder_spans) = match max_rank {
+            Some(max_rank) => {
+                let total_bytes: usize = decoder
+                    .values()
+                    .chain(special_tokens_decoder.values())
+                    .map(Vec::len)
+                    .sum();
+                let mut arena: Vec<u8> = Vec::with_capacity(total_bytes);
+                let mut spans: Vec<(u32, u32)> = vec![(0, 0); max_rank as usize + 1];
+                for (&rank, bytes) in decoder.iter().chain(special_tokens_decoder.iter()) {
+                    let start = arena.len() as u32;
+                    arena.extend_from_slice(bytes);
+                    spans[rank as usize] = (start, arena.len() as u32);
+                }
+                (arena, spans)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+
         // Clone because I don't know how to tell Rust I'm not going to change the map
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
@@ -669,6 +714,8 @@ impl CoreBPE {
             special_tokens_encoder,
             decoder,
             special_tokens_decoder,
+            decoder_arena,
+            decoder_spans,
             regex_tls,
             special_regex_tls,
             sorted_token_bytes,
