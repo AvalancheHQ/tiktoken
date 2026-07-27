@@ -196,18 +196,34 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+    let mut out = Vec::new();
+    byte_pair_encode_into(piece, ranks, &mut out);
+    out
+}
+
+/// Byte-pair-encodes `piece` and appends the resulting token ranks to `out`.
+///
+/// This is the append-in-place counterpart of [`byte_pair_encode`]. The hot
+/// encode loops tokenise many regex pieces into a single output vector, so
+/// writing each piece's tokens straight into that shared vector avoids
+/// allocating (and immediately freeing) a throwaway `Vec<Rank>` per piece. The
+/// produced tokens are identical to `out.extend(byte_pair_encode(piece, ranks))`.
+pub fn byte_pair_encode_into(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>, out: &mut Vec<Rank>) {
     let piece_len = piece.len();
 
     if piece_len == 1 {
-        return vec![ranks[piece]];
+        out.push(ranks[piece]);
+        return;
     }
     if piece_len < 100 {
-        return _byte_pair_merge(ranks, piece)
-            .windows(2)
-            .map(|part| ranks[&piece[part[0].0..part[1].0]])
-            .collect();
+        let parts = _byte_pair_merge(ranks, piece);
+        out.reserve(parts.len().saturating_sub(1));
+        for part in parts.windows(2) {
+            out.push(ranks[&piece[part[0].0..part[1].0]]);
+        }
+        return;
     }
-    _byte_pair_merge_large(ranks, piece)
+    out.extend(_byte_pair_merge_large(ranks, piece));
 }
 
 pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<&'a [u8]> {
@@ -384,7 +400,7 @@ impl CoreBPE {
             let piece = mat.unwrap().as_str().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+                None => byte_pair_encode_into(piece, &self.encoder, &mut ret),
             }
         }
         ret
@@ -436,9 +452,9 @@ impl CoreBPE {
                     ret.push(*token);
                     continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
-                last_piece_token_len = tokens.len();
-                ret.extend(&tokens);
+                let before = ret.len();
+                byte_pair_encode_into(piece, &self.encoder, &mut ret);
+                last_piece_token_len = ret.len() - before;
             }
 
             match next_special {
