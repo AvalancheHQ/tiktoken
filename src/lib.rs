@@ -339,19 +339,26 @@ impl CoreBPE {
         &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
     }
 
+    /// Resolves a token id to its decoded bytes, checking the regular decoder
+    /// first and then the special-tokens decoder.
+    ///
+    /// This is the single source of truth for the token lookup order used by
+    /// every decode path (both the pure-Rust `decode_bytes` and the fused
+    /// Python `list` fast path in `py.rs`), so they cannot diverge.
+    pub(crate) fn token_bytes(&self, token: Rank) -> Option<&[u8]> {
+        self.decoder
+            .get(&token)
+            .or_else(|| self.special_tokens_decoder.get(&token))
+            .map(Vec::as_slice)
+    }
+
     /// Decodes tokens into a list of bytes.
     ///
     /// The bytes are not gauranteed to be a valid utf-8 string.
     fn decode_bytes(&self, tokens: &[Rank]) -> Result<Vec<u8>, DecodeKeyError> {
         let mut ret = Vec::with_capacity(tokens.len() * 2);
         for &token in tokens {
-            let token_bytes = match self.decoder.get(&token) {
-                Some(bytes) => bytes,
-                None => self
-                    .special_tokens_decoder
-                    .get(&token)
-                    .ok_or(DecodeKeyError { token })?,
-            };
+            let token_bytes = self.token_bytes(token).ok_or(DecodeKeyError { token })?;
             ret.extend(token_bytes);
         }
         Ok(ret)

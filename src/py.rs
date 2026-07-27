@@ -155,26 +155,44 @@ impl CoreBPE {
 
     #[pyo3(name = "decode_bytes")]
     fn py_decode_bytes(&self, py: Python, tokens: &Bound<'_, PyAny>) -> Result<Py<PyBytes>, PyErr> {
-        // Taking the argument as `Vec<Rank>` makes pyo3 unmarshal the Python
-        // list through its generic sequence extraction, which drives the Python
-        // iterator protocol (`PyIterator::next`) once per element. On large
-        // token lists this argument conversion — not the actual byte copying in
-        // `decode_bytes` — dominates decode time.
+        // Fast path for the common case where `tokens` is a concrete `list`:
+        // resolve every token to its byte slice, then copy those bytes exactly
+        // once, straight into the destination Python `bytes` object. Avoiding
+        // the intermediate `Vec<Rank>` and `Vec<u8>` (i.e. that single copy) is
+        // the win, not the traversal count — this still walks the tokens twice.
         //
-        // When the argument is a concrete `list`, read it with the `PyList`
-        // iterator (which indexes elements directly, without the iterator
-        // protocol object) into a right-sized buffer. Anything else falls back
-        // to the original generic extraction so behavior is unchanged.
-        let tokens: Vec<Rank> = match tokens.downcast::<PyList>() {
-            Ok(list) => {
-                let mut out = Vec::with_capacity(list.len());
-                for item in list.iter() {
-                    out.push(item.extract::<Rank>()?);
-                }
-                out
+        // Note: unlike the non-`list` path, this holds the GIL for the whole
+        // decode because it reads Python list items throughout. That is the
+        // right trade single-threaded, but it does not release the GIL the way
+        // `py.detach` does, so multi-threaded decoding on a GIL build won't
+        // overlap here.
+        if let Ok(list) = tokens.downcast::<PyList>() {
+            // Resolve every token to its byte slice and accumulate total length.
+            let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
+            let mut total_len = 0usize;
+            for item in list.iter() {
+                let token = read_rank(&item)?;
+                let token_bytes = self.token_bytes(token).ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!(
+                        "Invalid token for decoding: {token}"
+                    ))
+                })?;
+                total_len += token_bytes.len();
+                slices.push(token_bytes);
             }
-            Err(_) => tokens.extract()?,
-        };
+            // Copy the resolved bytes directly into the final buffer.
+            let bytes = PyBytes::new_with(py, total_len, |mut buf| {
+                for s in &slices {
+                    buf[..s.len()].copy_from_slice(s);
+                    buf = &mut buf[s.len()..];
+                }
+                Ok(())
+            })?;
+            return Ok(bytes.into());
+        }
+
+        // Non-`list` inputs keep the original generic extraction path.
+        let tokens: Vec<Rank> = tokens.extract()?;
         match py.detach(|| self.decode_bytes(&tokens)) {
             Ok(bytes) => Ok(PyBytes::new(py, &bytes).into()),
             Err(e) => Err(pyo3::exceptions::PyKeyError::new_err(format!("{}", e))),
@@ -201,6 +219,28 @@ impl CoreBPE {
             .map(|x| PyBytes::new(py, x).into())
             .collect()
     }
+}
+
+/// Read a token id from a Python object, reading a plain in-range `int` with a
+/// direct CPython C-API call and otherwise falling back to pyo3's `extract`.
+#[inline]
+fn read_rank(item: &Bound<'_, PyAny>) -> PyResult<Rank> {
+    // SAFETY: `item` is a valid, non-null borrowed Python object for the
+    // duration of the call, and we hold the GIL (we have a `Bound`).
+    let value = unsafe { pyo3::ffi::PyLong_AsUnsignedLong(item.as_ptr()) };
+    // `PyLong_AsUnsignedLong` returns `(c_ulong)-1` on error *and* for the
+    // legitimate value `c_ulong::MAX`, so the sentinel must always route to the
+    // slow path, which disambiguates the two.
+    if value != std::os::raw::c_ulong::MAX
+        && let Ok(rank) = Rank::try_from(value)
+    {
+        return Ok(rank);
+    }
+    // Fall back to `extract` to preserve the exact original error types
+    // (`OverflowError` for negative / out-of-range, `TypeError` for non-int).
+    // `PyErr_Clear` is a no-op when the sentinel was the legitimate value.
+    unsafe { pyo3::ffi::PyErr_Clear() };
+    item.extract::<Rank>()
 }
 
 #[pyclass(frozen)]
