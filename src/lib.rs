@@ -196,18 +196,38 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+    let mut out = Vec::new();
+    byte_pair_encode_into(piece, ranks, &mut out);
+    out
+}
+
+/// Byte-pair-encode `piece` and append the resulting token ranks to `out`.
+///
+/// This is the hot-loop entry point used by `encode`/`encode_ordinary`: it
+/// writes tokens directly into the caller's shared output vector instead of
+/// allocating a fresh `Vec<Rank>` per piece (which was then copied into `ret`
+/// and immediately freed). The produced tokens are byte-for-byte identical to
+/// the previous `out.extend(byte_pair_encode(piece, ranks))`.
+fn byte_pair_encode_into(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>, out: &mut Vec<Rank>) {
     let piece_len = piece.len();
 
     if piece_len == 1 {
-        return vec![ranks[piece]];
+        out.push(ranks[piece]);
+        return;
     }
     if piece_len < 100 {
-        return _byte_pair_merge(ranks, piece)
-            .windows(2)
-            .map(|part| ranks[&piece[part[0].0..part[1].0]])
-            .collect();
+        let parts = _byte_pair_merge(ranks, piece);
+        // `parts` holds the final token boundaries as (start, _) pairs plus a
+        // trailing sentinel, so there are `parts.len() - 1` tokens. Reserve them
+        // up front so appending never reallocates, then resolve each token's
+        // rank with a direct indexed walk.
+        out.reserve(parts.len() - 1);
+        for w in parts.windows(2) {
+            out.push(ranks[&piece[w[0].0..w[1].0]]);
+        }
+        return;
     }
-    _byte_pair_merge_large(ranks, piece)
+    out.extend(_byte_pair_merge_large(ranks, piece));
 }
 
 pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<&'a [u8]> {
@@ -379,12 +399,17 @@ impl CoreBPE {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
         let regex = self._get_tl_regex();
-        let mut ret = vec![];
+        // Pre-size the output. Natural-language text produces roughly one token
+        // every few bytes, so reserving proportionally to the input length
+        // avoids the reallocation chain the token vector would otherwise incur
+        // as it grows from empty. This is a capacity hint only, so it never
+        // changes the produced tokens.
+        let mut ret = Vec::with_capacity(text.len() / 4 + 16);
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+                None => byte_pair_encode_into(piece, &self.encoder, &mut ret),
             }
         }
         ret
@@ -397,7 +422,9 @@ impl CoreBPE {
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let regex = self._get_tl_regex();
-        let mut ret = vec![];
+        // Pre-size the output; see `encode_ordinary` for the rationale. Capacity
+        // hint only, does not change the produced tokens.
+        let mut ret = Vec::with_capacity(text.len() / 4 + 16);
 
         let mut start = 0;
         let mut last_piece_token_len = 0;
@@ -436,9 +463,12 @@ impl CoreBPE {
                     ret.push(*token);
                     continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
-                last_piece_token_len = tokens.len();
-                ret.extend(&tokens);
+                // Append this piece's tokens directly into `ret` (no throwaway
+                // per-piece `Vec<Rank>`) and recover how many were produced from
+                // the length delta.
+                let before = ret.len();
+                byte_pair_encode_into(piece, &self.encoder, &mut ret);
+                last_piece_token_len = ret.len() - before;
             }
 
             match next_special {
