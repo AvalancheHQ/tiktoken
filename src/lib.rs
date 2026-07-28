@@ -395,9 +395,41 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
-        let special_regex = self._get_tl_special_regex();
         let regex = self._get_tl_regex();
         let mut ret = vec![];
+
+        // Fast path: when no special tokens are allowed, no special-token match
+        // can ever break the inner loop below, so the whole special-regex
+        // machinery (a full scan of `text` by `special_regex.find_from_pos`)
+        // would be pure overhead. Tokenize the entire text with the ordinary
+        // regex directly, which is exactly what the general path degenerates to
+        // in this case (including the `last_piece_token_len` bookkeeping).
+        if allowed_special.is_empty() {
+            let mut last_piece_token_len = 0;
+            for mat_res in regex.find_iter(text) {
+                let mat = match mat_res {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return Err(EncodeError {
+                            message: format!("Regex error while tokenizing: {e}"),
+                        });
+                    }
+                };
+
+                let piece = mat.as_str().as_bytes();
+                if let Some(token) = self.encoder.get(piece) {
+                    last_piece_token_len = 1;
+                    ret.push(*token);
+                    continue;
+                }
+                let tokens = byte_pair_encode(piece, &self.encoder);
+                last_piece_token_len = tokens.len();
+                ret.extend(&tokens);
+            }
+            return Ok((ret, last_piece_token_len));
+        }
+
+        let special_regex = self._get_tl_special_regex();
 
         let mut start = 0;
         let mut last_piece_token_len = 0;
