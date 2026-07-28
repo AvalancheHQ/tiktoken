@@ -167,7 +167,10 @@ impl CoreBPE {
         // `py.detach` does, so multi-threaded decoding on a GIL build won't
         // overlap here.
         if let Ok(list) = tokens.downcast::<PyList>() {
-            // Resolve every token to its byte slice and accumulate total length.
+            // First pass: resolve every token to its byte slice and accumulate
+            // the total decoded length. We keep the resolved slices so the copy
+            // pass does not have to re-read the Python list and re-resolve every
+            // token a second time.
             let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
             let mut total_len = 0usize;
             for item in list.iter() {
@@ -181,14 +184,29 @@ impl CoreBPE {
                 slices.push(token_bytes);
             }
             // Copy the resolved bytes directly into the final buffer.
-            let bytes = PyBytes::new_with(py, total_len, |mut buf| {
+            //
+            // Allocate the destination `bytes` with the CPython C-API rather than
+            // `PyBytes::new_with`. `new_with` zero-fills the whole buffer before
+            // handing it over (`ptr::write_bytes(buf, 0, len)`), but we then
+            // overwrite every byte with decoded content, so that memset is pure
+            // redundant work — it shows up as a measurable, memory-bound `memset`
+            // in the decode profile. Writing into the fresh (uninitialised)
+            // buffer exactly once removes it. This is sound because we write
+            // precisely `total_len` bytes, fully covering the buffer, before the
+            // object is observed.
+            unsafe {
+                let pyptr =
+                    pyo3::ffi::PyBytes_FromStringAndSize(std::ptr::null(), total_len as isize);
+                let bytes: Bound<'_, PyBytes> =
+                    Bound::from_owned_ptr_or_err(py, pyptr)?.cast_into_unchecked();
+                let mut buf: *mut u8 = pyo3::ffi::PyBytes_AsString(pyptr).cast();
+                debug_assert!(!buf.is_null());
                 for s in &slices {
-                    buf[..s.len()].copy_from_slice(s);
-                    buf = &mut buf[s.len()..];
+                    std::ptr::copy_nonoverlapping(s.as_ptr(), buf, s.len());
+                    buf = buf.add(s.len());
                 }
-                Ok(())
-            })?;
-            return Ok(bytes.into());
+                return Ok(bytes.into());
+            }
         }
 
         // Non-`list` inputs keep the original generic extraction path.
