@@ -156,10 +156,18 @@ impl CoreBPE {
     #[pyo3(name = "decode_bytes")]
     fn py_decode_bytes(&self, py: Python, tokens: &Bound<'_, PyAny>) -> Result<Py<PyBytes>, PyErr> {
         // Fast path for the common case where `tokens` is a concrete `list`:
-        // resolve every token to its byte slice, then copy those bytes exactly
-        // once, straight into the destination Python `bytes` object. Avoiding
-        // the intermediate `Vec<Rank>` and `Vec<u8>` (i.e. that single copy) is
-        // the win, not the traversal count — this still walks the tokens twice.
+        // stream every token's bytes straight into the destination Python
+        // `bytes` object in a single pass over the list.
+        //
+        // The previous shape of this path walked the tokens twice: once to
+        // resolve each token to its byte slice into a `Vec<&[u8]>` and sum the
+        // total length, then again to copy. That side table is 16 bytes per
+        // token — for a 64 KiB document it is ~220 KiB written and read back,
+        // more memory traffic than the decoded output itself, and the profile
+        // showed the decode loop was memory-bound. Writing each token's bytes
+        // into the output buffer as soon as it is resolved removes the table
+        // (and the second traversal) entirely: the buffer is allocated from a
+        // capacity estimate and trimmed to the exact length at the end.
         //
         // Note: unlike the non-`list` path, this holds the GIL for the whole
         // decode because it reads Python list items throughout. That is the
@@ -167,28 +175,41 @@ impl CoreBPE {
         // `py.detach` does, so multi-threaded decoding on a GIL build won't
         // overlap here.
         if let Ok(list) = tokens.downcast::<PyList>() {
-            // Resolve every token to its byte slice and accumulate total length.
-            let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
-            let mut total_len = 0usize;
-            for item in list.iter() {
-                let token = read_rank(&item)?;
-                let token_bytes = self.token_bytes(token).ok_or_else(|| {
-                    pyo3::exceptions::PyKeyError::new_err(format!(
-                        "Invalid token for decoding: {token}"
-                    ))
-                })?;
-                total_len += token_bytes.len();
-                slices.push(token_bytes);
-            }
-            // Copy the resolved bytes directly into the final buffer.
-            let bytes = PyBytes::new_with(py, total_len, |mut buf| {
-                for s in &slices {
-                    buf[..s.len()].copy_from_slice(s);
-                    buf = &mut buf[s.len()..];
-                }
-                Ok(())
-            })?;
-            return Ok(bytes.into());
+            // Tokens decode to ~4.6 bytes on average for natural-language text,
+            // so this sizes the buffer generously enough that the common case
+            // never has to grow, while staying within ~10% of the final size.
+            let capacity = list.len().saturating_mul(5).saturating_add(64);
+            let mut out = BytesWriter::new(py, capacity)?;
+            // Items are read as borrowed pointers: the reference counts of the
+            // token `int`s are left alone, which keeps their (scattered) object
+            // headers clean instead of dirtying a cache line per token. The
+            // critical section makes that sound on free-threaded builds by
+            // locking the list against concurrent mutation; it compiles away on
+            // GIL builds.
+            let result: PyResult<()> =
+                pyo3::sync::critical_section::with_critical_section(&list, || {
+                    for index in 0..list.len() {
+                        // SAFETY: `index` is in bounds, and the list cannot be
+                        // mutated while we hold the critical section, so the
+                        // borrowed item stays alive for the iteration.
+                        let item = unsafe {
+                            pyo3::ffi::PyList_GET_ITEM(
+                                list.as_ptr(),
+                                index as pyo3::ffi::Py_ssize_t,
+                            )
+                        };
+                        let token = read_rank(py, item)?;
+                        let token_bytes = self.token_bytes(token).ok_or_else(|| {
+                            pyo3::exceptions::PyKeyError::new_err(format!(
+                                "Invalid token for decoding: {token}"
+                            ))
+                        })?;
+                        out.extend(py, token_bytes)?;
+                    }
+                    Ok(())
+                });
+            result?;
+            return out.finish(py);
         }
 
         // Non-`list` inputs keep the original generic extraction path.
@@ -221,13 +242,154 @@ impl CoreBPE {
     }
 }
 
-/// Read a token id from a Python object, reading a plain in-range `int` with a
-/// direct CPython C-API call and otherwise falling back to pyo3's `extract`.
+/// Copies one token's bytes to `dst`.
+///
+/// Tokens are short (a handful of bytes for natural-language text), and at that
+/// size the call into `memcpy` costs more than the copy itself. Lengths up to 16
+/// bytes are handled with a pair of overlapping fixed-width loads and stores,
+/// which never touch a byte outside `src`/`dst[..src.len()]`.
+///
+/// # Safety
+///
+/// `dst` must be valid for writes of `src.len()` bytes and must not overlap
+/// `src`.
 #[inline]
-fn read_rank(item: &Bound<'_, PyAny>) -> PyResult<Rank> {
+unsafe fn copy_token_bytes(src: &[u8], dst: *mut u8) {
+    let n = src.len();
+    let src = src.as_ptr();
+    unsafe {
+        if n >= 8 {
+            if n > 16 {
+                std::ptr::copy_nonoverlapping(src, dst, n);
+                return;
+            }
+            let head = src.cast::<u64>().read_unaligned();
+            let tail = src.add(n - 8).cast::<u64>().read_unaligned();
+            dst.cast::<u64>().write_unaligned(head);
+            dst.add(n - 8).cast::<u64>().write_unaligned(tail);
+        } else if n >= 4 {
+            let head = src.cast::<u32>().read_unaligned();
+            let tail = src.add(n - 4).cast::<u32>().read_unaligned();
+            dst.cast::<u32>().write_unaligned(head);
+            dst.add(n - 4).cast::<u32>().write_unaligned(tail);
+        } else if n > 0 {
+            // 1..=3 bytes: first, middle and last, which overlap for n < 3.
+            *dst = *src;
+            *dst.add(n / 2) = *src.add(n / 2);
+            *dst.add(n - 1) = *src.add(n - 1);
+        }
+    }
+}
+
+/// An append-only writer over the buffer of a Python `bytes` object.
+///
+/// The object is allocated up front from a capacity estimate, filled in place,
+/// and trimmed to the exact number of bytes written by `finish`. This lets a
+/// decode loop copy each token's bytes directly into their final destination as
+/// they are resolved, with no intermediate buffer or side table, and no second
+/// traversal to compute the output length first.
+struct BytesWriter {
+    /// Owned strong reference to the `bytes` object being filled, or null once
+    /// ownership has been handed over (`finish`) or released (resize failure).
+    obj: *mut pyo3::ffi::PyObject,
+    /// Interior buffer of `obj`. Re-read after every resize, which may move it.
+    buf: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+impl BytesWriter {
+    fn new(py: Python<'_>, cap: usize) -> PyResult<Self> {
+        // SAFETY: we hold the GIL. A null data pointer asks CPython for an
+        // uninitialised buffer of `cap` bytes, which we fill before anyone can
+        // observe the object.
+        let obj = unsafe {
+            pyo3::ffi::PyBytes_FromStringAndSize(std::ptr::null(), cap as pyo3::ffi::Py_ssize_t)
+        };
+        if obj.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let buf = unsafe { pyo3::ffi::PyBytes_AS_STRING(obj) }
+            .cast::<u8>()
+            .cast_mut();
+        Ok(Self {
+            obj,
+            buf,
+            len: 0,
+            cap,
+        })
+    }
+
+    #[inline]
+    fn extend(&mut self, py: Python<'_>, bytes: &[u8]) -> PyResult<()> {
+        if self.len + bytes.len() > self.cap {
+            self.grow(py, bytes.len())?;
+        }
+        // SAFETY: the branch above guarantees `bytes.len()` spare capacity at
+        // `self.len`, and `bytes` borrows from the decoder, never from `buf`.
+        unsafe { copy_token_bytes(bytes, self.buf.add(self.len)) };
+        self.len += bytes.len();
+        Ok(())
+    }
+
+    /// Grows the buffer so that at least `additional` more bytes fit.
+    #[cold]
+    fn grow(&mut self, py: Python<'_>, additional: usize) -> PyResult<()> {
+        let cap = (self.len + additional).max(self.cap * 2);
+        // SAFETY: we hold the only reference to `obj`, which is the contract of
+        // `_PyBytes_Resize`. On failure it clears `obj` for us (the object is
+        // deallocated), so we must not decrement its refcount afterwards.
+        let ok =
+            unsafe { pyo3::ffi::_PyBytes_Resize(&mut self.obj, cap as pyo3::ffi::Py_ssize_t) == 0 };
+        if !ok {
+            self.obj = std::ptr::null_mut();
+            return Err(PyErr::fetch(py));
+        }
+        self.buf = unsafe { pyo3::ffi::PyBytes_AS_STRING(self.obj) }
+            .cast::<u8>()
+            .cast_mut();
+        self.cap = cap;
+        Ok(())
+    }
+
+    /// Trims the object to the bytes actually written and hands it over.
+    fn finish(mut self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        if self.len != self.cap {
+            // SAFETY: see `grow`; shrinking follows the same contract.
+            let ok = unsafe {
+                pyo3::ffi::_PyBytes_Resize(&mut self.obj, self.len as pyo3::ffi::Py_ssize_t) == 0
+            };
+            if !ok {
+                self.obj = std::ptr::null_mut();
+                return Err(PyErr::fetch(py));
+            }
+        }
+        let obj = std::mem::replace(&mut self.obj, std::ptr::null_mut());
+        // SAFETY: `obj` is a valid, fully initialised `bytes` object and we own
+        // the reference we are transferring here.
+        let bytes = unsafe { Bound::from_owned_ptr(py, obj).cast_into_unchecked::<PyBytes>() };
+        Ok(bytes.unbind())
+    }
+}
+
+impl Drop for BytesWriter {
+    fn drop(&mut self) {
+        if !self.obj.is_null() {
+            // SAFETY: `BytesWriter` is only reachable while the GIL is held and
+            // owns this reference.
+            unsafe { pyo3::ffi::Py_DECREF(self.obj) };
+        }
+    }
+}
+
+/// Read a token id from a borrowed Python object pointer, reading a plain
+/// in-range `int` with a direct CPython C-API call and otherwise falling back to
+/// pyo3's `extract`.
+#[inline]
+fn read_rank(py: Python<'_>, item: *mut pyo3::ffi::PyObject) -> PyResult<Rank> {
     // SAFETY: `item` is a valid, non-null borrowed Python object for the
-    // duration of the call, and we hold the GIL (we have a `Bound`).
-    let value = unsafe { pyo3::ffi::PyLong_AsUnsignedLong(item.as_ptr()) };
+    // duration of the call, and the caller keeps it alive.
+    let value = unsafe { pyo3::ffi::PyLong_AsUnsignedLong(item) };
     // `PyLong_AsUnsignedLong` returns `(c_ulong)-1` on error *and* for the
     // legitimate value `c_ulong::MAX`, so the sentinel must always route to the
     // slow path, which disambiguates the two.
@@ -240,6 +402,9 @@ fn read_rank(item: &Bound<'_, PyAny>) -> PyResult<Rank> {
     // (`OverflowError` for negative / out-of-range, `TypeError` for non-int).
     // `PyErr_Clear` is a no-op when the sentinel was the legitimate value.
     unsafe { pyo3::ffi::PyErr_Clear() };
+    // SAFETY: as above; this takes its own reference for the duration of the
+    // fallback conversion.
+    let item = unsafe { Bound::from_borrowed_ptr(py, item) };
     item.extract::<Rank>()
 }
 
