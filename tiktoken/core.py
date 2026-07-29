@@ -115,16 +115,22 @@ class Encoding:
         """
         if allowed_special == "all":
             allowed_special = self.special_tokens_set
-        if disallowed_special == "all":
-            disallowed_special = self.special_tokens_set - allowed_special
-        if disallowed_special:
+        # `disallowed_special="all"` (the default) means "every special token that
+        # is not allowed". That is exactly the decision the core already makes for
+        # each special token it finds while scanning for the allowed ones, so let
+        # it report the first offender instead of building the complement set and
+        # walking the whole text again here with a second regex engine.
+        disallow_other_special = disallowed_special == "all"
+        if not disallow_other_special and disallowed_special:
             if not isinstance(disallowed_special, frozenset):
                 disallowed_special = frozenset(disallowed_special)
             if match := _special_token_regex(disallowed_special).search(text):
                 raise_disallowed_special_token(match.group())
 
         try:
-            return self._core_bpe.encode(text, allowed_special)
+            return self._core_bpe.encode(text, allowed_special, disallow_other_special)
+        except _tiktoken.DisallowedSpecialTokenError as e:
+            raise_disallowed_special_token(e.args[0])
         except UnicodeEncodeError:
             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
@@ -133,7 +139,10 @@ class Encoding:
             # string, but given that this is input we want to support, maybe that's okay.
             # Also we use errors="replace" to handle weird things like lone surrogates.
             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
-            return self._core_bpe.encode(text, allowed_special)
+            try:
+                return self._core_bpe.encode(text, allowed_special, disallow_other_special)
+            except _tiktoken.DisallowedSpecialTokenError as e:
+                raise_disallowed_special_token(e.args[0])
 
     def encode_to_numpy(
         self,

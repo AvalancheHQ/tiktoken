@@ -8,7 +8,16 @@ use pyo3::{
 };
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::{CoreBPE, Rank, byte_pair_encode};
+use crate::{CoreBPE, EncodeSpecialError, Rank, byte_pair_encode};
+
+pyo3::create_exception!(
+    _tiktoken,
+    DisallowedSpecialTokenError,
+    exceptions::PyValueError,
+    "Raised by `encode` when the text contains a special token that the caller \
+     did not allow. Derives from `ValueError`, which is what the Python wrapper \
+     re-raises it as."
+);
 
 #[pymethods]
 impl CoreBPE {
@@ -31,19 +40,32 @@ impl CoreBPE {
         py.detach(|| self.encode_ordinary(text))
     }
 
-    #[pyo3(name = "encode")]
+    #[pyo3(name = "encode", signature = (text, allowed_special, disallow_other_special = false))]
     fn py_encode(
         &self,
         py: Python,
         text: &str,
-        allowed_special: HashSet<PyBackedStr>,
+        allowed_special: &Bound<'_, PyAny>,
+        disallow_other_special: bool,
     ) -> PyResult<Vec<Rank>> {
+        // Materialising the allowed set costs a Python-level iteration plus a
+        // Rust allocation on every call. The overwhelmingly common case is an
+        // empty set, so recognise it without iterating.
+        let allowed_special: HashSet<PyBackedStr> = match allowed_special.len() {
+            Ok(0) => HashSet::new(),
+            _ => allowed_special.extract()?,
+        };
         py.detach(|| {
             let allowed_special: HashSet<&str> =
                 allowed_special.iter().map(|s| s.as_ref()).collect();
-            match self.encode(text, &allowed_special) {
+            match self.encode_checking_special(text, &allowed_special, disallow_other_special) {
                 Ok((tokens, _)) => Ok(tokens),
-                Err(e) => Err(PyErr::new::<exceptions::PyValueError, _>(e.message)),
+                Err(EncodeSpecialError::DisallowedSpecialToken(token)) => {
+                    Err(DisallowedSpecialTokenError::new_err(token))
+                }
+                Err(EncodeSpecialError::Encode(e)) => {
+                    Err(PyErr::new::<exceptions::PyValueError, _>(e.message))
+                }
             }
         })
     }
@@ -311,5 +333,9 @@ impl TiktokenBuffer {
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<CoreBPE>()?;
+    m.add(
+        "DisallowedSpecialTokenError",
+        _py.get_type::<DisallowedSpecialTokenError>(),
+    )?;
     Ok(())
 }
