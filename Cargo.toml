@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 default = []
 python = [
     "pyo3",
+    "mimalloc",
 ]
 
 [dependencies]
@@ -18,6 +19,7 @@ pyo3 = { version = "0.28.3", default-features = false, features = [
     "extension-module",
     "macros",
 ], optional = true }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 # tiktoken dependencies
 fancy-regex = "0.17.0"
