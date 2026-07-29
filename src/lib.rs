@@ -44,7 +44,117 @@ struct State {
     cur_rank: Rank,
 }
 
-fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<Rank> {
+/// Read-only view of a token vocabulary, as used by the byte-pair merge loops.
+///
+/// The merge loops ask for two different things: the rank of a *byte pair*
+/// (once per position when a piece is first scanned) and the rank of an
+/// arbitrary *span* of a piece (twice per merge, plus once per emitted token).
+/// Keeping them apart lets an implementation answer the byte-pair question,
+/// which has a key space of only 65_536 values, without hashing anything.
+///
+/// `Rank::MAX` is used as the "no such token" sentinel; real vocabularies are
+/// many orders of magnitude smaller, so it can never collide with a token.
+pub trait RankLookup {
+    /// Rank of the two-byte token `[b0, b1]`, or `Rank::MAX` if there is none.
+    fn pair_rank(&self, b0: u8, b1: u8) -> Rank;
+
+    /// Rank of the token `bytes`, or `Rank::MAX` if there is none.
+    fn span_rank(&self, bytes: &[u8]) -> Rank;
+}
+
+impl RankLookup for HashMap<Vec<u8>, Rank> {
+    #[inline(always)]
+    fn pair_rank(&self, b0: u8, b1: u8) -> Rank {
+        self.span_rank(&[b0, b1])
+    }
+
+    #[inline(always)]
+    fn span_rank(&self, bytes: &[u8]) -> Rank {
+        self.get(bytes).copied().unwrap_or(Rank::MAX)
+    }
+}
+
+/// The encoder vocabulary plus dense, directly indexed tables for the shortest
+/// tokens.
+///
+/// Looking a token up in the hash map means hashing its bytes and then
+/// comparing them against a heap-allocated `Vec<u8>` key. For one- and
+/// two-byte tokens the entire key space fits in a flat array (256 and 65_536
+/// entries), so the same question is answered by a single indexed load. That
+/// covers a large share of the lookups on the hot path: the byte-pair scan
+/// that opens every BPE merge, and the one- and two-byte pieces that the
+/// tokeniser regex produces (punctuation, single letters, digits, ...).
+///
+/// The tables cost 256 KiB per encoding and are built once, at construction.
+#[derive(Clone)]
+pub struct Vocab {
+    map: HashMap<Vec<u8>, Rank>,
+    /// Rank of every single-byte token, indexed by the byte itself.
+    single: Box<[Rank]>,
+    /// Rank of every two-byte token, indexed by `(b0 << 8) | b1`.
+    pair: Box<[Rank]>,
+}
+
+impl Vocab {
+    fn new(map: HashMap<Vec<u8>, Rank>) -> Self {
+        let mut single = vec![Rank::MAX; 256];
+        let mut pair = vec![Rank::MAX; 256 * 256];
+        for (bytes, &rank) in map.iter() {
+            match bytes.as_slice() {
+                [b0] => single[*b0 as usize] = rank,
+                [b0, b1] => pair[((*b0 as usize) << 8) | *b1 as usize] = rank,
+                _ => {}
+            }
+        }
+        Self {
+            map,
+            single: single.into_boxed_slice(),
+            pair: pair.into_boxed_slice(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn get(&self, bytes: &[u8]) -> Option<Rank> {
+        match self.span_rank(bytes) {
+            Rank::MAX => None,
+            rank => Some(rank),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.map.keys()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Rank)> {
+        self.map.iter()
+    }
+}
+
+impl RankLookup for Vocab {
+    #[inline(always)]
+    fn pair_rank(&self, b0: u8, b1: u8) -> Rank {
+        self.pair[((b0 as usize) << 8) | b1 as usize]
+    }
+
+    #[inline(always)]
+    fn span_rank(&self, bytes: &[u8]) -> Rank {
+        match *bytes {
+            [b0] => self.single[b0 as usize],
+            [b0, b1] => self.pair_rank(b0, b1),
+            _ => self.map.get(bytes).copied().unwrap_or(Rank::MAX),
+        }
+    }
+}
+
+fn _byte_pair_merge_large<R: RankLookup + ?Sized>(ranks: &R, piece: &[u8]) -> Vec<Rank> {
     let mut state = Vec::with_capacity(piece.len());
     state.push(State {
         prev: usize::MAX,
@@ -56,7 +166,8 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
 
     let mut heap = BinaryHeap::with_capacity(piece.len());
     for i in 0..piece.len() - 1 {
-        if let Some(&rank) = ranks.get(&piece[i..i + 2]) {
+        let rank = ranks.pair_rank(piece[i], piece[i + 1]);
+        if rank != Rank::MAX {
             heap.push(Merge { start: i, rank });
             state[i].next_rank = rank;
         }
@@ -84,12 +195,13 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
          next_end_item: usize| {
             state[start].next_end = next_end_item;
             state[start].next_rank = Rank::MAX; // Always invalidate the old merge
-            if next_end_item <= piece.len()
-                && let Some(&rank) = ranks.get(&piece[start..next_end_item])
-            {
-                // We have a valid potential merge!
-                heap.push(Merge { start, rank });
-                state[start].next_rank = rank;
+            if next_end_item <= piece.len() {
+                let rank = ranks.span_rank(&piece[start..next_end_item]);
+                if rank != Rank::MAX {
+                    // We have a valid potential merge!
+                    heap.push(Merge { start, rank });
+                    state[start].next_rank = rank;
+                }
             }
         }
     };
@@ -130,41 +242,66 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
         if state[i].cur_rank != Rank::MAX {
             result.push(state[i].cur_rank);
         } else {
-            result.push(ranks[&piece[i..state[i].end]]);
+            result.push(ranks.span_rank(&piece[i..state[i].end]));
         }
         i = state[i].end;
     }
     result
 }
 
-fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
-    // This is a vector of (start, rank).
-    // The rank is of the pair starting at position start.
-    let mut parts = Vec::with_capacity(piece.len() + 1);
+/// One element of the `parts` list maintained by `_byte_pair_merge`.
+///
+/// `pair_rank` is the rank of the token obtained by merging this part with the
+/// one after it (`Rank::MAX` when there is no such token), which is what drives
+/// the merge order. `rank` is the rank of the part *itself*: it is filled in
+/// with the merge rank at the moment the part is created by a merge, so the
+/// caller does not have to look the resulting token up again. Parts that were
+/// never merged are still single bytes and keep `Rank::MAX` here.
+#[derive(Clone, Copy)]
+struct Part {
+    start: u32,
+    pair_rank: Rank,
+    rank: Rank,
+}
+
+fn _byte_pair_merge<R: RankLookup + ?Sized>(ranks: &R, piece: &[u8]) -> Vec<Part> {
+    // This is a vector of parts, each recording where it starts in `piece` and
+    // the rank of the pair starting there.
+    let mut parts: Vec<Part> = Vec::with_capacity(piece.len() + 1);
 
     // Note that we hash bytes when indexing into `ranks`, not token pairs. As long as we train BPE
     // the way we currently do, this is equivalent. An easy way to break this would be to decouple
     // merge priority from token index or to prevent specific token merges.
     let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
     for i in 0..piece.len() - 1 {
-        let rank = *ranks.get(&piece[i..i + 2]).unwrap_or(&Rank::MAX);
+        let rank = ranks.pair_rank(piece[i], piece[i + 1]);
         if rank < min_rank.0 {
             min_rank = (rank, i);
         }
-        parts.push((i, rank));
+        parts.push(Part {
+            start: i as u32,
+            pair_rank: rank,
+            rank: Rank::MAX,
+        });
     }
-    parts.push((piece.len() - 1, Rank::MAX));
-    parts.push((piece.len(), Rank::MAX));
+    parts.push(Part {
+        start: (piece.len() - 1) as u32,
+        pair_rank: Rank::MAX,
+        rank: Rank::MAX,
+    });
+    parts.push(Part {
+        start: piece.len() as u32,
+        pair_rank: Rank::MAX,
+        rank: Rank::MAX,
+    });
 
     let get_rank = {
         #[inline(always)]
-        |parts: &Vec<(usize, Rank)>, i: usize| {
+        |parts: &Vec<Part>, i: usize| {
             if (i + 3) < parts.len() {
                 // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
                 // parts[i + 1], see comment in the main loop.
-                *ranks
-                    .get(&piece[parts[i].0..parts[i + 3].0])
-                    .unwrap_or(&Rank::MAX)
+                ranks.span_rank(&piece[parts[i].start as usize..parts[i + 3].start as usize])
             } else {
                 Rank::MAX
             }
@@ -177,18 +314,21 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
     // complexity downsides of the `parts` vector.
     while min_rank.0 != Rank::MAX {
         let i = min_rank.1;
+        // `parts[i].pair_rank` is the rank of the token that merging parts[i] and parts[i + 1]
+        // produces, so the new part's own rank is known here for free.
+        parts[i].rank = min_rank.0;
         // Update parts[i] and parts[i - 1] before removing parts[i + 1], since
         // `parts.remove(i + 1)` will thrash the cache.
         if i > 0 {
-            parts[i - 1].1 = get_rank(&parts, i - 1);
+            parts[i - 1].pair_rank = get_rank(&parts, i - 1);
         }
-        parts[i].1 = get_rank(&parts, i);
+        parts[i].pair_rank = get_rank(&parts, i);
         parts.remove(i + 1);
 
         min_rank = (Rank::MAX, usize::MAX);
-        for (i, &(_, rank)) in parts[..parts.len() - 1].iter().enumerate() {
-            if rank < min_rank.0 {
-                min_rank = (rank, i);
+        for (i, part) in parts[..parts.len() - 1].iter().enumerate() {
+            if part.pair_rank < min_rank.0 {
+                min_rank = (part.pair_rank, i);
             }
         }
     }
@@ -196,15 +336,27 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+    byte_pair_encode_with(piece, ranks)
+}
+
+pub(crate) fn byte_pair_encode_with<R: RankLookup + ?Sized>(piece: &[u8], ranks: &R) -> Vec<Rank> {
     let piece_len = piece.len();
 
     if piece_len == 1 {
-        return vec![ranks[piece]];
+        return vec![ranks.span_rank(piece)];
     }
     if piece_len < 100 {
         return _byte_pair_merge(ranks, piece)
             .windows(2)
-            .map(|part| ranks[&piece[part[0].0..part[1].0]])
+            .map(|part| {
+                // Parts produced by a merge already know their own rank; the
+                // rest are single bytes, which the dense table answers.
+                if part[0].rank != Rank::MAX {
+                    part[0].rank
+                } else {
+                    ranks.span_rank(&piece[part[0].start as usize..part[1].start as usize])
+                }
+            })
             .collect();
     }
     _byte_pair_merge_large(ranks, piece)
@@ -214,7 +366,7 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
     assert!(piece.len() > 1);
     _byte_pair_merge(ranks, piece)
         .windows(2)
-        .map(|part| &piece[part[0].0..part[1].0])
+        .map(|part| &piece[part[0].start as usize..part[1].start as usize])
         .collect()
 }
 
@@ -318,7 +470,7 @@ const MAX_NUM_THREADS: usize = 128;
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
-    encoder: HashMap<Vec<u8>, Rank>,
+    encoder: Vocab,
     special_tokens_encoder: HashMap<String, Rank>,
     decoder: HashMap<Rank, Vec<u8>>,
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
@@ -383,8 +535,8 @@ impl CoreBPE {
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
             match self.encoder.get(piece) {
-                Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+                Some(token) => ret.push(token),
+                None => ret.extend(&byte_pair_encode_with(piece, &self.encoder)),
             }
         }
         ret
@@ -433,10 +585,10 @@ impl CoreBPE {
                 let piece = mat.as_str().as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
-                    ret.push(*token);
+                    ret.push(token);
                     continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
+                let tokens = byte_pair_encode_with(piece, &self.encoder);
                 last_piece_token_len = tokens.len();
                 ret.extend(&tokens);
             }
@@ -536,7 +688,9 @@ impl CoreBPE {
             && self.sorted_token_bytes[point].starts_with(&unstable_bytes)
         {
             completions.insert(vec![
-                self.encoder[self.sorted_token_bytes[point].as_slice()],
+                self.encoder
+                    .get(self.sorted_token_bytes[point].as_slice())
+                    .unwrap(),
             ]);
             point += 1;
         }
@@ -568,7 +722,7 @@ impl CoreBPE {
                     // would be a regex split before the UTF-8 truncation point.
                     // Probably niche enough that no one will ever notice (after all, people didn't
                     // notice all the big holes in the previous unstable token implementation)
-                    Err(_) => byte_pair_encode(&possibility, &self.encoder),
+                    Err(_) => byte_pair_encode_with(&possibility, &self.encoder),
                     // Something like the following is intriguing but incorrect:
                     // Err(e) => self.encode_ordinary(unsafe {
                     //     std::str::from_utf8_unchecked(&possibility[..e.valid_up_to()])
@@ -601,11 +755,11 @@ impl CoreBPE {
             if unstable_bytes.len() - last_decoded.1 > 0
                 && last_decoded.0.is_some_and(|c| c.is_whitespace())
             {
-                let mut reencoded = byte_pair_encode(
+                let mut reencoded = byte_pair_encode_with(
                     &unstable_bytes[..unstable_bytes.len() - last_decoded.1],
                     &self.encoder,
                 );
-                reencoded.extend(byte_pair_encode(
+                reencoded.extend(byte_pair_encode_with(
                     &unstable_bytes[unstable_bytes.len() - last_decoded.1..],
                     &self.encoder,
                 ));
@@ -682,6 +836,10 @@ impl CoreBPE {
         // Clone because I don't know how to tell Rust I'm not going to change the map
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
+
+        // Wrap the vocabulary in the dense-table view used by the encode hot
+        // path (see `Vocab`).
+        let encoder = Vocab::new(encoder);
 
         // Compile an independent regex per thread-local slot instead of cloning one. Cloning a
         // `fancy_regex::Regex` shares an `Arc<Prog>` whose regex-automata engines keep their scratch
