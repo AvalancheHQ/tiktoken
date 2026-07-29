@@ -1,10 +1,11 @@
 use std::collections::HashSet;
+use std::ffi::CString;
 
 use pyo3::{
     IntoPyObjectExt, PyResult, exceptions,
     prelude::*,
     pybacked::PyBackedStr,
-    types::{PyBytes, PyList},
+    types::{PyBytes, PyList, PyString},
 };
 use rustc_hash::FxHashMap as HashMap;
 
@@ -168,18 +169,7 @@ impl CoreBPE {
         // overlap here.
         if let Ok(list) = tokens.downcast::<PyList>() {
             // Resolve every token to its byte slice and accumulate total length.
-            let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
-            let mut total_len = 0usize;
-            for item in list.iter() {
-                let token = read_rank(&item)?;
-                let token_bytes = self.token_bytes(token).ok_or_else(|| {
-                    pyo3::exceptions::PyKeyError::new_err(format!(
-                        "Invalid token for decoding: {token}"
-                    ))
-                })?;
-                total_len += token_bytes.len();
-                slices.push(token_bytes);
-            }
+            let (slices, total_len) = self.resolve_token_slices(list)?;
             // Copy the resolved bytes directly into the final buffer.
             let bytes = PyBytes::new_with(py, total_len, |mut buf| {
                 for s in &slices {
@@ -195,6 +185,35 @@ impl CoreBPE {
         let tokens: Vec<Rank> = tokens.extract()?;
         match py.detach(|| self.decode_bytes(&tokens)) {
             Ok(bytes) => Ok(PyBytes::new(py, &bytes).into()),
+            Err(e) => Err(pyo3::exceptions::PyKeyError::new_err(format!("{}", e))),
+        }
+    }
+
+    /// Decodes tokens straight into a Python `str`.
+    ///
+    /// `Encoding.decode` used to build an intermediate `bytes` object and then
+    /// let Python re-decode it with `bytes.decode("utf-8", errors=...)`. That
+    /// meant the text was materialised twice (once in the `bytes` buffer, once
+    /// in the `str`), plus pyo3's defensive zero-fill of the `bytes` buffer and
+    /// an extra Python-level call. Here the token bytes are written once,
+    /// directly into the buffer of the `str` object that is returned.
+    #[pyo3(name = "decode_str")]
+    #[pyo3(signature = (tokens, errors="replace"))]
+    fn py_decode_str(
+        &self,
+        py: Python<'_>,
+        tokens: &Bound<'_, PyAny>,
+        errors: &str,
+    ) -> PyResult<Py<PyString>> {
+        if let Ok(list) = tokens.downcast::<PyList>() {
+            let (slices, total_len) = self.resolve_token_slices(list)?;
+            return chunks_to_str(py, &slices, total_len, errors);
+        }
+
+        // Non-`list` inputs keep the original generic extraction path.
+        let tokens: Vec<Rank> = tokens.extract()?;
+        match py.detach(|| self.decode_bytes(&tokens)) {
+            Ok(bytes) => chunks_to_str(py, &[bytes.as_slice()], bytes.len(), errors),
             Err(e) => Err(pyo3::exceptions::PyKeyError::new_err(format!("{}", e))),
         }
     }
@@ -218,6 +237,90 @@ impl CoreBPE {
             .iter()
             .map(|x| PyBytes::new(py, x).into())
             .collect()
+    }
+}
+
+impl CoreBPE {
+    /// Resolves every token of a Python `list` to its byte slice, also
+    /// returning the total number of bytes they represent.
+    ///
+    /// The slices borrow from the tokeniser's decode tables, so no token bytes
+    /// are copied here.
+    #[inline]
+    fn resolve_token_slices<'a>(
+        &'a self,
+        list: &Bound<'_, PyList>,
+    ) -> PyResult<(Vec<&'a [u8]>, usize)> {
+        let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
+        let mut total_len = 0usize;
+        for item in list.iter() {
+            let token = read_rank(&item)?;
+            let token_bytes = self.token_bytes(token).ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "Invalid token for decoding: {token}"
+                ))
+            })?;
+            total_len += token_bytes.len();
+            slices.push(token_bytes);
+        }
+        Ok((slices, total_len))
+    }
+}
+
+/// Concatenates `chunks` (whose lengths sum to `total_len`) into a Python `str`.
+///
+/// The bytes are written once, into the buffer of a freshly allocated `str`
+/// object that nothing else can observe yet. Decoded text is overwhelmingly
+/// ASCII, in which case the filled object *is* the answer and is returned as
+/// is. Otherwise the bytes are handed to CPython's UTF-8 decoder (which applies
+/// `errors`, exactly like the previous `bytes.decode("utf-8", errors=...)`) and
+/// the scratch object is dropped.
+fn chunks_to_str(
+    py: Python<'_>,
+    chunks: &[&[u8]],
+    total_len: usize,
+    errors: &str,
+) -> PyResult<Py<PyString>> {
+    if total_len == 0 {
+        return Ok(PyString::new(py, "").unbind());
+    }
+    // SAFETY: `scratch` is a fresh, unshared `str` object of exactly
+    // `total_len` bytes, so writing that many bytes into its buffer cannot
+    // overflow it and cannot be observed by any other code. It is only handed
+    // back to Python once its contents are known to be ASCII (and hence a
+    // valid ASCII `str`); otherwise it is dropped without being exposed.
+    unsafe {
+        let scratch = pyo3::ffi::PyUnicode_New(total_len as pyo3::ffi::Py_ssize_t, 127);
+        if scratch.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let buf = pyo3::ffi::PyUnicode_DATA(scratch).cast::<u8>();
+        let mut offset = 0usize;
+        for chunk in chunks {
+            std::ptr::copy_nonoverlapping(chunk.as_ptr(), buf.add(offset), chunk.len());
+            offset += chunk.len();
+        }
+        debug_assert_eq!(offset, total_len);
+
+        if std::slice::from_raw_parts(buf, total_len).is_ascii() {
+            return Ok(Bound::from_owned_ptr(py, scratch)
+                .cast_into_unchecked()
+                .unbind());
+        }
+
+        let errors = CString::new(errors)?;
+        let decoded = pyo3::ffi::PyUnicode_DecodeUTF8(
+            buf.cast::<std::os::raw::c_char>(),
+            total_len as pyo3::ffi::Py_ssize_t,
+            errors.as_ptr(),
+        );
+        pyo3::ffi::Py_DECREF(scratch);
+        if decoded.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        Ok(Bound::from_owned_ptr(py, decoded)
+            .cast_into_unchecked()
+            .unbind())
     }
 }
 

@@ -284,7 +284,7 @@ class Encoding:
         'hello world'
         ```
         """
-        return self._core_bpe.decode_bytes(tokens).decode("utf-8", errors=errors)
+        return self._core_bpe.decode_str(tokens, errors)
 
     def decode_single_token_bytes(self, token: int) -> bytes:
         """Decodes a token into bytes.
