@@ -313,6 +313,29 @@ impl std::fmt::Display for EncodeError {
 
 impl std::error::Error for EncodeError {}
 
+/// Why an encode that also enforces the caller's special-token policy failed.
+#[derive(Debug, Clone)]
+pub enum EncodeSpecialError {
+    /// The tokeniser regex failed.
+    Encode(EncodeError),
+    /// The text contains this special token, which the caller did not allow.
+    DisallowedSpecialToken(String),
+}
+
+impl std::fmt::Display for EncodeSpecialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            EncodeSpecialError::Encode(e) => e.fmt(f),
+            EncodeSpecialError::DisallowedSpecialToken(token) => write!(
+                f,
+                "Encountered text corresponding to disallowed special token {token}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EncodeSpecialError {}
+
 const MAX_NUM_THREADS: usize = 128;
 
 #[cfg_attr(feature = "python", pyclass(frozen))]
@@ -395,6 +418,30 @@ impl CoreBPE {
         text: &str,
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
+        self.encode_checking_special(text, allowed_special, false)
+            .map_err(|e| match e {
+                EncodeSpecialError::Encode(e) => e,
+                // Unreachable: nothing is disallowed when the flag is off.
+                EncodeSpecialError::DisallowedSpecialToken(token) => EncodeError {
+                    message: format!("Disallowed special token: {token}"),
+                },
+            })
+    }
+
+    /// Like [`Self::encode`], but when `disallow_other_special` is set, fails on
+    /// the first special token in `text` that is not in `allowed_special`.
+    ///
+    /// This is the default policy of the Python `Encoding.encode`, which used to
+    /// enforce it by scanning the whole text with a second regex engine before
+    /// calling in here. The scan below already visits every special token in the
+    /// text and already decides whether it is allowed, so enforcing the policy
+    /// here costs nothing and removes that duplicate pass.
+    pub fn encode_checking_special(
+        &self,
+        text: &str,
+        allowed_special: &HashSet<&str>,
+        disallow_other_special: bool,
+    ) -> Result<(Vec<Rank>, usize), EncodeSpecialError> {
         let special_regex = self._get_tl_special_regex();
         let regex = self._get_tl_regex();
         let mut ret = vec![];
@@ -409,8 +456,14 @@ impl CoreBPE {
                 next_special = special_regex.find_from_pos(text, start_find).unwrap();
                 match next_special {
                     Some(m) => {
-                        if allowed_special.contains(&text[m.start()..m.end()]) {
+                        let special = &text[m.start()..m.end()];
+                        if allowed_special.contains(special) {
                             break;
+                        }
+                        if disallow_other_special {
+                            return Err(EncodeSpecialError::DisallowedSpecialToken(
+                                special.to_string(),
+                            ));
                         }
                         start_find = m.start() + 1;
                     }
@@ -424,9 +477,9 @@ impl CoreBPE {
                 let mat = match mat_res {
                     Ok(m) => m,
                     Err(e) => {
-                        return Err(EncodeError {
+                        return Err(EncodeSpecialError::Encode(EncodeError {
                             message: format!("Regex error while tokenizing: {e}"),
-                        });
+                        }));
                     }
                 };
 
