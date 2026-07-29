@@ -5,6 +5,8 @@ use std::thread;
 use fancy_regex::Regex;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+use regex_automata::{Input as RaInput, PatternID, meta::Regex as MetaRegex};
+use regex_syntax::hir::{Class, ClassUnicode, ClassUnicodeRange, Hir, HirKind, Look};
 use rustc_hash::FxHashMap as HashMap;
 
 #[cfg(feature = "python")]
@@ -259,6 +261,440 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
+// Splitting the text with the tokeniser pattern is by far the hottest part of encoding: it is
+// where ~80% of `encode`/`encode_ordinary` is spent. The patterns shipped with tiktoken use two
+// "fancy" constructs that force `fancy_regex` onto its backtracking VM, which allocates a fresh
+// state (several `Vec`s) for *every* match it produces:
+//
+//   * possessive quantifiers (`\p{L}++`, `[^\r\n\p{L}\p{N}]?+`, `\p{N}{1,3}+`, ...)
+//   * the negative lookahead in `\s+(?!\S)`
+//
+// Neither is actually needed: below we rewrite such a pattern into an equivalent *lookaround-free*
+// set of patterns that the `regex` engine can run as a single automaton, with no backtracking VM
+// and no per-match allocation. The rewrite is only used when every step of it is provably
+// equivalence preserving (see `relax_alternative`); anything we cannot prove falls back to
+// `fancy_regex`, so behaviour is unchanged for arbitrary user-supplied patterns.
+
+/// The negative-lookahead idiom used by every tiktoken pattern to keep the last whitespace
+/// character of a run attached to the following piece.
+const WS_LOOKAHEAD: &str = r"\s+(?!\S)";
+
+/// Lookaround-free stand-ins for [`WS_LOOKAHEAD`].
+///
+/// `\s+(?!\S)` matches a greedy run of whitespace that is followed by whitespace or by the end of
+/// the text. Since `\s+` is greedy, the character after the run is never whitespace, so the
+/// alternative can only succeed by giving back its last character (or by ending at the end of the
+/// text). That is exactly:
+///
+/// * `\s+$` – the whole run, when it ends the text; and
+/// * `\s\s+` – a run of at least two characters, minus its last character (dropped by
+///   [`FastMatches`] as a fixup when the match does not end the text).
+///
+/// A single whitespace character followed by a non-whitespace one matches neither, which mirrors
+/// the original alternative failing and the search falling through to the next alternative.
+const WS_LOOKAHEAD_REPLACEMENTS: [&str; 2] = [r"\s+$", r"\s\s+"];
+
+/// One `atom quantifier` pair of a regex alternative.
+struct Element<'a> {
+    atom: &'a str,
+    /// `""`, `"*"`, `"+"`, `"?"` or `"{m,n}"`, possibly with a trailing `?` (lazy).
+    quantifier: &'a str,
+    /// Whether the quantifier carried a possessive `+` marker.
+    possessive: bool,
+}
+
+/// Splits `pattern` on its top-level `|`, ignoring `|` inside groups, character classes and
+/// escapes. Returns `None` if the pattern is not balanced.
+fn split_alternatives(pattern: &str) -> Option<Vec<&str>> {
+    let b = pattern.as_bytes();
+    let mut alts = Vec::new();
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => depth += 1,
+            b')' if !in_class => depth = depth.checked_sub(1)?,
+            b'|' if !in_class && depth == 0 => {
+                alts.push(&pattern[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_class || depth != 0 {
+        return None;
+    }
+    alts.push(&pattern[start..]);
+    Some(alts)
+}
+
+/// Tokenises one alternative into `atom quantifier` elements. Returns `None` for anything the
+/// simple scanner does not understand (in which case we keep using `fancy_regex`).
+fn parse_elements(alt: &str) -> Option<Vec<Element<'_>>> {
+    let b = alt.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let atom_start = i;
+        match b[i] {
+            b'\\' => {
+                i += 1;
+                let c = *b.get(i)?;
+                i += 1;
+                // `\p{...}`, `\P{...}` and `\x{...}` carry a braced argument.
+                if matches!(c, b'p' | b'P' | b'x') && b.get(i) == Some(&b'{') {
+                    while *b.get(i)? != b'}' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'[' => {
+                i += 1;
+                if b.get(i) == Some(&b'^') {
+                    i += 1;
+                }
+                if b.get(i) == Some(&b']') {
+                    i += 1;
+                }
+                loop {
+                    match *b.get(i)? {
+                        b'\\' => i += 2,
+                        // Nested/POSIX classes: not worth handling, bail out.
+                        b'[' => return None,
+                        b']' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'(' => {
+                let mut depth = 0usize;
+                let mut in_class = false;
+                loop {
+                    match *b.get(i)? {
+                        b'\\' => i += 1,
+                        b'[' if !in_class => in_class = true,
+                        b']' if in_class => in_class = false,
+                        b'(' if !in_class => depth += 1,
+                        b')' if !in_class => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                // A bare flag group like `(?i)` changes the meaning of everything that follows it
+                // in the *whole* pattern, which splitting into separate patterns would break.
+                let group = &alt[atom_start..i];
+                if group.starts_with("(?") && !group[2..].contains(':') {
+                    return None;
+                }
+            }
+            _ => {
+                i += 1;
+                while i < b.len() && (b[i] & 0xC0) == 0x80 {
+                    i += 1;
+                }
+            }
+        }
+        let atom = &alt[atom_start..i];
+
+        let quant_start = i;
+        match b.get(i) {
+            Some(b'*') | Some(b'+') | Some(b'?') => i += 1,
+            Some(b'{') => {
+                let mut j = i + 1;
+                while matches!(b.get(j), Some(c) if c.is_ascii_digit() || *c == b',') {
+                    j += 1;
+                }
+                if j > i + 1 && b.get(j) == Some(&b'}') {
+                    i = j + 1;
+                }
+            }
+            _ => {}
+        }
+        let mut quantifier = &alt[quant_start..i];
+        let mut possessive = false;
+        if !quantifier.is_empty() {
+            match b.get(i) {
+                Some(b'+') => {
+                    possessive = true;
+                    i += 1;
+                }
+                Some(b'?') => {
+                    i += 1;
+                    quantifier = &alt[quant_start..i];
+                }
+                _ => {}
+            }
+        }
+
+        out.push(Element {
+            atom,
+            quantifier,
+            possessive,
+        });
+    }
+    Some(out)
+}
+
+fn parse_hir(pattern: &str) -> Option<Hir> {
+    regex_syntax::Parser::new().parse(pattern).ok()
+}
+
+/// The set of characters `hir` can start with, unioned into `acc`. Returns whether `hir` can match
+/// without consuming any character, or `None` if we cannot analyse it.
+fn first_set(hir: &Hir, acc: &mut ClassUnicode) -> Option<bool> {
+    match hir.kind() {
+        HirKind::Empty => Some(true),
+        HirKind::Literal(lit) => match std::str::from_utf8(&lit.0).ok()?.chars().next() {
+            None => Some(true),
+            Some(c) => {
+                acc.union(&ClassUnicode::new([ClassUnicodeRange::new(c, c)]));
+                Some(false)
+            }
+        },
+        HirKind::Class(Class::Unicode(cls)) => {
+            acc.union(cls);
+            Some(false)
+        }
+        HirKind::Class(Class::Bytes(_)) => None,
+        // Zero-width: cannot consume a character, so keep looking at what follows.
+        HirKind::Look(_) => Some(true),
+        HirKind::Repetition(rep) => {
+            let sub_nullable = first_set(&rep.sub, acc)?;
+            Some(rep.min == 0 || sub_nullable)
+        }
+        HirKind::Capture(cap) => first_set(&cap.sub, acc),
+        HirKind::Concat(subs) => {
+            for sub in subs {
+                if !first_set(sub, acc)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
+        }
+        HirKind::Alternation(subs) => {
+            let mut nullable = false;
+            for sub in subs {
+                nullable |= first_set(sub, acc)?;
+            }
+            Some(nullable)
+        }
+    }
+}
+
+/// Is dropping the possessive marker of `elements[idx]` (i.e. turning it into a plain greedy
+/// quantifier) guaranteed to preserve the meaning of the alternative?
+///
+/// A possessive quantifier differs from a greedy one only when the greedy one *backtracks*, i.e.
+/// gives characters back so that the rest of the alternative can match. So the rewrite is safe
+/// whenever such a backtrack can never succeed (or can never happen at all).
+fn possessive_drop_is_safe(elements: &[Element<'_>], idx: usize) -> bool {
+    let rest: String = elements[idx + 1..]
+        .iter()
+        .map(|e| [e.atom, e.quantifier].concat())
+        .collect();
+    let Some(rest_hir) = parse_hir(&rest) else {
+        return false;
+    };
+    let props = rest_hir.properties();
+
+    // (a) The rest matches the empty string unconditionally, so the greedy quantifier always
+    //     succeeds at its longest match and never backtracks.
+    if props.minimum_len() == Some(0) && props.look_set().is_empty() {
+        return true;
+    }
+    // (b) The rest is just an end-of-text anchor. Backtracking moves the anchor strictly before
+    //     the end of the text, where it can never match.
+    if matches!(rest_hir.kind(), HirKind::Look(Look::End)) {
+        return true;
+    }
+    // (c) The rest must consume at least one character, and that character can never be one the
+    //     quantifier consumed, so giving characters back can never let it match.
+    let Some(atom_hir) = parse_hir(elements[idx].atom) else {
+        return false;
+    };
+    let mut consumed = ClassUnicode::empty();
+    match atom_hir.kind() {
+        HirKind::Class(Class::Unicode(cls)) => consumed.union(cls),
+        HirKind::Literal(_) => {
+            if first_set(&atom_hir, &mut consumed) != Some(false) {
+                return false;
+            }
+        }
+        // Only single-character atoms let us reason about what a backtrack gives back.
+        _ => return false,
+    }
+    let mut follows = ClassUnicode::empty();
+    if first_set(&rest_hir, &mut follows) != Some(false) {
+        return false;
+    }
+    consumed.intersect(&follows);
+    consumed.ranges().is_empty()
+}
+
+/// Rewrites one alternative into an equivalent lookaround-free one, or `None` if we cannot.
+fn relax_alternative(alt: &str) -> Option<String> {
+    let elements = parse_elements(alt)?;
+    if !elements.iter().any(|e| e.possessive) {
+        return Some(alt.to_string());
+    }
+    for (idx, element) in elements.iter().enumerate() {
+        if element.possessive && !possessive_drop_is_safe(&elements, idx) {
+            return None;
+        }
+    }
+    Some(
+        elements
+            .iter()
+            .map(|e| [e.atom, e.quantifier].concat())
+            .collect(),
+    )
+}
+
+/// A lookaround-free rewrite of a tokeniser pattern, run as a multi-pattern `regex` automaton.
+///
+/// Each top-level alternative of the original pattern becomes one pattern; leftmost-first matching
+/// over the pattern list is exactly the leftmost-first semantics of the original alternation.
+#[derive(Clone)]
+struct FastSplitter {
+    regex: MetaRegex,
+    /// Pattern id of the `\s\s+` stand-in for `\s+(?!\S)`, whose match needs the lookahead fixup.
+    ws_fixup: Option<PatternID>,
+}
+
+impl FastSplitter {
+    fn new(pattern: &str) -> Option<Self> {
+        let mut patterns: Vec<String> = Vec::new();
+        let mut ws_fixup = None;
+        for alt in split_alternatives(pattern)? {
+            if alt == WS_LOOKAHEAD {
+                ws_fixup = Some(PatternID::new(patterns.len() + 1).ok()?);
+                patterns.extend(WS_LOOKAHEAD_REPLACEMENTS.iter().map(|p| p.to_string()));
+            } else {
+                patterns.push(relax_alternative(alt)?);
+            }
+        }
+        let regex = MetaRegex::new_many(&patterns).ok()?;
+        Some(FastSplitter { regex, ws_fixup })
+    }
+
+    fn find_iter<'r, 't>(&'r self, text: &'t str) -> FastMatches<'r, 't> {
+        FastMatches {
+            splitter: self,
+            text,
+            pos: 0,
+            last_match: None,
+        }
+    }
+}
+
+struct FastMatches<'r, 't> {
+    splitter: &'r FastSplitter,
+    text: &'t str,
+    pos: usize,
+    last_match: Option<usize>,
+}
+
+impl<'t> Iterator for FastMatches<'_, 't> {
+    type Item = &'t str;
+
+    fn next(&mut self) -> Option<&'t str> {
+        loop {
+            if self.pos > self.text.len() {
+                return None;
+            }
+            let input = RaInput::new(self.text).span(self.pos..self.text.len());
+            let m = self.splitter.regex.search(&input)?;
+            let start = m.start();
+            let mut end = m.end();
+            if Some(m.pattern()) == self.splitter.ws_fixup && end < self.text.len() {
+                // `\s+(?!\S)` gives back the last character of the run whenever the run is
+                // followed by a non-whitespace character (which greedy matching guarantees here).
+                let last = self.text[start..end].chars().next_back()?;
+                end -= last.len_utf8();
+            }
+            if start == end {
+                // Empty match: step over one character so we keep making progress, and never
+                // report an empty match right after another match (same as `fancy_regex`).
+                self.pos = end + self.text[end..].chars().next().map_or(1, char::len_utf8);
+                if self.last_match == Some(end) {
+                    continue;
+                }
+            } else {
+                self.pos = end;
+            }
+            self.last_match = Some(end);
+            return Some(&self.text[start..end]);
+        }
+    }
+}
+
+/// The regex used to split text into pieces, either the fast lookaround-free rewrite or the
+/// original `fancy_regex` pattern.
+#[derive(Clone)]
+enum Splitter {
+    Fast(FastSplitter),
+    Fancy(Regex),
+}
+
+impl Splitter {
+    fn new(pattern: &str) -> fancy_regex::Result<Self> {
+        match FastSplitter::new(pattern) {
+            Some(fast) => Ok(Splitter::Fast(fast)),
+            None => Ok(Splitter::Fancy(Regex::new(pattern)?)),
+        }
+    }
+
+    /// Builds an independent copy for another thread-local slot.
+    ///
+    /// Cloning a [`MetaRegex`] gives the copy its own (lock-free) cache pool, but cloning a
+    /// `fancy_regex::Regex` shares one, so the fallback path is recompiled instead.
+    fn thread_copy(&self, pattern: &str) -> fancy_regex::Result<Self> {
+        match self {
+            Splitter::Fast(fast) => Ok(Splitter::Fast(fast.clone())),
+            Splitter::Fancy(_) => Ok(Splitter::Fancy(Regex::new(pattern)?)),
+        }
+    }
+
+    fn find_iter<'r, 't>(&'r self, text: &'t str) -> SplitterMatches<'r, 't> {
+        match self {
+            Splitter::Fast(fast) => SplitterMatches::Fast(fast.find_iter(text)),
+            Splitter::Fancy(regex) => SplitterMatches::Fancy(regex.find_iter(text)),
+        }
+    }
+}
+
+enum SplitterMatches<'r, 't> {
+    Fast(FastMatches<'r, 't>),
+    Fancy(fancy_regex::Matches<'r, 't>),
+}
+
+impl<'t> Iterator for SplitterMatches<'_, 't> {
+    type Item = fancy_regex::Result<&'t str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            SplitterMatches::Fast(it) => it.next().map(Ok),
+            SplitterMatches::Fancy(it) => it.next().map(|m| m.map(|m| m.as_str())),
+        }
+    }
+}
+
 struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -329,13 +765,13 @@ pub struct CoreBPE {
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
-    regex_tls: Vec<Regex>,
+    regex_tls: Vec<Splitter>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
 
 impl CoreBPE {
-    fn _get_tl_regex(&self) -> &Regex {
+    fn _get_tl_regex(&self) -> &Splitter {
         // See performance notes above for what this is about
         // It's also a little janky, please make a better version of it!
         // However, it's nice that this doesn't leak memory to short-lived threads
@@ -381,7 +817,7 @@ impl CoreBPE {
         let regex = self._get_tl_regex();
         let mut ret = vec![];
         for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+            let piece = mat.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -421,8 +857,8 @@ impl CoreBPE {
 
             // Okay, here we go, compare this logic to encode_ordinary
             for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
+                let piece = match mat_res {
+                    Ok(m) => m.as_bytes(),
                     Err(e) => {
                         return Err(EncodeError {
                             message: format!("Regex error while tokenizing: {e}"),
@@ -430,7 +866,6 @@ impl CoreBPE {
                     }
                 };
 
-                let piece = mat.as_str().as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
                     ret.push(*token);
@@ -683,13 +1118,14 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
-        // Compile an independent regex per thread-local slot instead of cloning one. Cloning a
-        // `fancy_regex::Regex` shares an `Arc<Prog>` whose regex-automata engines keep their scratch
-        // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
-        // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
-        // lock-free path), paying the compile cost once at construction rather than on the hot path.
+        // Give every thread-local slot a regex with its own scratch pool. Sharing one pool across
+        // threads makes the regex-automata engines take a mutex-guarded slow path during
+        // multi-threaded batch encoding, so each slot gets an independent copy (see
+        // `Splitter::thread_copy`), paying that cost once at construction rather than on the hot
+        // path.
+        let splitter = Splitter::new(pattern)?;
         let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
+            .map(|_| splitter.thread_copy(pattern))
             .collect::<Result<Vec<_>, _>>()?;
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
@@ -743,5 +1179,60 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PAT: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K_PAT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// Every piece produced by the fast, lookaround-free splitter must be identical to the one
+    /// `fancy_regex` produces for the original pattern.
+    fn assert_same_split(pattern: &str, text: &str) {
+        let fast = crate::FastSplitter::new(pattern)
+            .unwrap_or_else(|| panic!("expected a fast path for {pattern}"));
+        let expected: Vec<&str> = Regex::new(pattern)
+            .unwrap()
+            .find_iter(text)
+            .map(|m| m.unwrap().as_str())
+            .collect();
+        let actual: Vec<&str> = fast.find_iter(text).collect();
+        assert_eq!(actual, expected, "pattern {pattern:?} on text {text:?}");
+    }
+
+    #[test]
+    fn test_fast_splitter_matches_fancy_regex() {
+        let texts = [
+            "",
+            " ",
+            "  ",
+            "\n",
+            "hello world",
+            "Hello  world  ",
+            "  leading and trailing   ",
+            "a\n\n\nb",
+            " \t \n \r\n  ",
+            "It's 12345 tokens, isn't it?!",
+            "мир 世界 🌍 emoji  test",
+            "tabs\tand\t\tspaces  \n\n  mixed",
+            "ALLCAPS and MiXeD'S case's",
+            "punctuation!!!...---   ###",
+            "trailing whitespace at end   ",
+            "1234567890 42 007",
+        ];
+        for pattern in [R50K_PAT, CL100K_PAT, O200K_PAT] {
+            for text in texts {
+                assert_same_split(pattern, text);
+            }
+        }
+    }
+
+    #[test]
+    fn test_unsafe_possessive_falls_back_to_fancy() {
+        // Dropping the possessive marker here would change the meaning (` ?+a` cannot backtrack,
+        // ` ?a` can), so no fast path must be built.
+        assert!(crate::FastSplitter::new(r" ?+ a| ?").is_none());
+        // Lookarounds we do not know about are not rewritten either.
+        assert!(crate::FastSplitter::new(r"foo(?=bar)").is_none());
     }
 }
