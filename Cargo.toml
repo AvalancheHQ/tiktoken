@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 default = []
 python = [
     "pyo3",
+    "mimalloc",
 ]
 
 [dependencies]
@@ -24,3 +25,11 @@ fancy-regex = "0.17.0"
 regex = "1.10.3"
 rustc-hash = "2"
 bstr = "1.5.0"
+
+# mimalloc is deliberately excluded on musl targets: `libmimalloc-sys` compiles
+# mimalloc with `-ftls-model=initial-exec` and without `MI_LIBC_MUSL`, both of
+# which are unsupported when the resulting `cdylib` is `dlopen`ed into CPython
+# under musl libc, and the extension module segfaults while initialising.
+# See microsoft/mimalloc#644 and microsoft/mimalloc#883.
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true }

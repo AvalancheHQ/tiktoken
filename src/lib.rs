@@ -10,6 +10,22 @@ use rustc_hash::FxHashMap as HashMap;
 #[cfg(feature = "python")]
 mod py;
 
+// The tokeniser is extremely allocation heavy: `fancy_regex` builds a fresh
+// backtracking-VM state (several `Vec`s that then grow) for *every* match it
+// produces, i.e. for every token of every piece of text we encode. Profiling
+// `encode_ordinary` shows ~15% of the total time inside glibc's
+// `malloc`/`realloc`/`free`, most of it on their slow paths.
+//
+// mimalloc serves those small, short-lived, same-size-class allocations from a
+// thread-local free list, which is both far fewer instructions and far friendlier
+// to the cache. It only applies to the Python extension module (the `python`
+// feature), so embedding `tiktoken` as a plain Rust crate keeps whatever global
+// allocator the host binary chose. musl targets are excluded as well, see the
+// note next to the dependency in Cargo.toml.
+#[cfg(all(feature = "python", not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub type Rank = u32;
 
 use std::collections::BinaryHeap;
