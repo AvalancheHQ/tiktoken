@@ -20,8 +20,9 @@ mod py;
 // thread-local free list, which is both far fewer instructions and far friendlier
 // to the cache. It only applies to the Python extension module (the `python`
 // feature), so embedding `tiktoken` as a plain Rust crate keeps whatever global
-// allocator the host binary chose.
-#[cfg(feature = "python")]
+// allocator the host binary chose. musl targets are excluded as well, see the
+// note next to the dependency in Cargo.toml.
+#[cfg(all(feature = "python", not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
