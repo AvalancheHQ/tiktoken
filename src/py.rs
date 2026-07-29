@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use pyo3::{
-    IntoPyObjectExt, PyResult, exceptions,
+    Borrowed, IntoPyObjectExt, PyResult, exceptions,
     prelude::*,
     pybacked::PyBackedStr,
     types::{PyBytes, PyList},
@@ -168,10 +168,34 @@ impl CoreBPE {
         // overlap here.
         if let Ok(list) = tokens.downcast::<PyList>() {
             // Resolve every token to its byte slice and accumulate total length.
+            //
+            // The list is walked by index with *borrowed* item references rather
+            // than pyo3's `BoundListIterator`. That iterator hands out owned
+            // `Bound` values, so every single token pays an extra
+            // `Py_INCREF`/`Py_DECREF` pair (each with its immortality check and a
+            // refcount store into the int object) purely to keep alive an object
+            // we read once and drop immediately. Borrowing the item removes that
+            // refcount churn from the hottest loop in `decode`.
+            //
+            // `list.len()` is re-read every iteration (an inline
+            // `PyList_GET_SIZE` field load) so that a list shrinking underneath
+            // us can never take us out of bounds — the same guard pyo3's own
+            // iterator applies. Only the `read_rank` fallback below can run
+            // arbitrary Python code, and it owns its reference before doing so.
             let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
             let mut total_len = 0usize;
-            for item in list.iter() {
-                let token = read_rank(&item)?;
+            let mut index = 0usize;
+            while index < list.len() {
+                // SAFETY: `index < list.len()` and we hold the GIL, so
+                // `PyList_GET_ITEM` yields a valid borrowed reference that stays
+                // alive for as long as the list holds it.
+                let item: Borrowed<'_, '_, PyAny> = unsafe {
+                    Borrowed::from_ptr(
+                        py,
+                        pyo3::ffi::PyList_GET_ITEM(list.as_ptr(), index as pyo3::ffi::Py_ssize_t),
+                    )
+                };
+                let token = read_rank(item)?;
                 let token_bytes = self.token_bytes(token).ok_or_else(|| {
                     pyo3::exceptions::PyKeyError::new_err(format!(
                         "Invalid token for decoding: {token}"
@@ -179,12 +203,17 @@ impl CoreBPE {
                 })?;
                 total_len += token_bytes.len();
                 slices.push(token_bytes);
+                index += 1;
             }
-            // Copy the resolved bytes directly into the final buffer.
+            // Copy the resolved bytes directly into the final buffer. Tokens are
+            // tiny (~4-5 bytes on natural language), so the copy is dominated by
+            // the fixed cost of entering `memcpy` once per token rather than by
+            // the bytes moved; `copy_short` keeps those copies inline.
             let bytes = PyBytes::new_with(py, total_len, |mut buf| {
                 for s in &slices {
-                    buf[..s.len()].copy_from_slice(s);
-                    buf = &mut buf[s.len()..];
+                    let len = s.len();
+                    copy_short(&mut buf[..len], s);
+                    buf = &mut buf[len..];
                 }
                 Ok(())
             })?;
@@ -221,10 +250,45 @@ impl CoreBPE {
     }
 }
 
+/// Copy `src` into `dst` (same length), specialised for the very short slices
+/// the decoder produces.
+///
+/// A plain `copy_from_slice` lowers to a `memcpy` call with a runtime length.
+/// Decoded tokens average ~4-5 bytes, so that call's fixed dispatch cost
+/// dominates the handful of bytes it actually moves — it shows up as a distinct
+/// `__memcpy_avx_unaligned_erms` frame worth several percent of `decode`.
+///
+/// Copying a fixed-size window instead lets the compiler emit plain loads and
+/// stores. Ranges are covered by two overlapping fixed-size copies, which stay
+/// entirely inside both slices (no over-read past the token's bytes), and longer
+/// slices fall back to `memcpy`, where it is worth its cost.
+#[inline(always)]
+fn copy_short(dst: &mut [u8], src: &[u8]) {
+    debug_assert_eq!(dst.len(), src.len());
+    let len = src.len();
+    if len >= 16 {
+        dst.copy_from_slice(src);
+    } else if len >= 8 {
+        dst[..8].copy_from_slice(&src[..8]);
+        dst[len - 8..].copy_from_slice(&src[len - 8..]);
+    } else if len >= 4 {
+        dst[..4].copy_from_slice(&src[..4]);
+        dst[len - 4..].copy_from_slice(&src[len - 4..]);
+    } else if len >= 2 {
+        dst[..2].copy_from_slice(&src[..2]);
+        dst[len - 2..].copy_from_slice(&src[len - 2..]);
+    } else if len == 1 {
+        dst[0] = src[0];
+    }
+}
+
 /// Read a token id from a Python object, reading a plain in-range `int` with a
 /// direct CPython C-API call and otherwise falling back to pyo3's `extract`.
+///
+/// Takes a borrowed reference: the decode loop reads each list item exactly once
+/// and does not need to own it, so this avoids a refcount pair per token.
 #[inline]
-fn read_rank(item: &Bound<'_, PyAny>) -> PyResult<Rank> {
+fn read_rank(item: Borrowed<'_, '_, PyAny>) -> PyResult<Rank> {
     // SAFETY: `item` is a valid, non-null borrowed Python object for the
     // duration of the call, and we hold the GIL (we have a `Bound`).
     let value = unsafe { pyo3::ffi::PyLong_AsUnsignedLong(item.as_ptr()) };
@@ -240,7 +304,9 @@ fn read_rank(item: &Bound<'_, PyAny>) -> PyResult<Rank> {
     // (`OverflowError` for negative / out-of-range, `TypeError` for non-int).
     // `PyErr_Clear` is a no-op when the sentinel was the legitimate value.
     unsafe { pyo3::ffi::PyErr_Clear() };
-    item.extract::<Rank>()
+    // Own the reference before the fallback: `extract` may invoke `__index__`,
+    // which can run arbitrary Python code and drop the object from its list.
+    item.to_owned().extract::<Rank>()
 }
 
 #[pyclass(frozen)]
