@@ -329,6 +329,15 @@ pub struct CoreBPE {
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
+    // One preallocated Python `int` object per token rank. Encoding returns a
+    // `list[int]`, and building it used to allocate a fresh `int` per token
+    // (rank values are far above CPython's small-int cache), which dominates
+    // the cost of handing the result back to Python. Ranks are dense and
+    // bounded by the vocabulary, so we can build every `int` once and hand out
+    // references instead. Filled in by the Python constructor; an empty cache
+    // (e.g. a `CoreBPE` built through the Rust API) falls back to allocating.
+    #[cfg(feature = "python")]
+    token_ints: std::sync::Arc<Vec<Py<pyo3::types::PyInt>>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
@@ -701,6 +710,8 @@ impl CoreBPE {
             decoder,
             special_tokens_decoder,
             decoder_flat,
+            #[cfg(feature = "python")]
+            token_ints: std::sync::Arc::new(Vec::new()),
             regex_tls,
             special_regex_tls,
             sorted_token_bytes,

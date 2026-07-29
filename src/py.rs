@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use pyo3::{
     IntoPyObjectExt, PyResult, exceptions,
@@ -10,16 +11,52 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::{CoreBPE, Rank, byte_pair_encode};
 
+impl CoreBPE {
+    /// Builds the per-rank Python `int` cache used by [`Self::tokens_into_pylist`].
+    fn init_token_ints(&mut self, py: Python<'_>) {
+        let len = self.decoder_flat.len();
+        let mut ints = Vec::with_capacity(len);
+        for rank in 0..len as Rank {
+            ints.push(rank.into_pyobject(py).unwrap().unbind());
+        }
+        self.token_ints = Arc::new(ints);
+    }
+
+    /// Turns encoded tokens into a Python `list[int]`, reusing the cached `int`
+    /// object of every rank instead of allocating a new one per token.
+    fn tokens_into_pylist<'py>(
+        &self,
+        py: Python<'py>,
+        tokens: &[Rank],
+    ) -> PyResult<Bound<'py, PyList>> {
+        PyList::new(
+            py,
+            tokens.iter().map(|&token| {
+                match self.token_ints.get(token as usize) {
+                    // Cheap: bump the refcount of the cached `int`.
+                    Some(cached) => cached.bind(py).clone().into_any(),
+                    // Ranks outside the vocabulary can't come out of the
+                    // encoder, but stay correct if the cache is empty.
+                    None => token.into_pyobject(py).unwrap().into_any(),
+                }
+            }),
+        )
+    }
+}
+
 #[pymethods]
 impl CoreBPE {
     #[new]
     fn py_new(
+        py: Python<'_>,
         encoder: HashMap<Vec<u8>, Rank>,
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> PyResult<Self> {
-        Self::new_internal(encoder, special_tokens_encoder, pattern)
-            .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))
+        let mut bpe = Self::new_internal(encoder, special_tokens_encoder, pattern)
+            .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?;
+        bpe.init_token_ints(py);
+        Ok(bpe)
     }
 
     // ====================
@@ -27,25 +64,27 @@ impl CoreBPE {
     // ====================
 
     #[pyo3(name = "encode_ordinary")]
-    fn py_encode_ordinary(&self, py: Python, text: &str) -> Vec<Rank> {
-        py.detach(|| self.encode_ordinary(text))
+    fn py_encode_ordinary<'py>(&self, py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyList>> {
+        let tokens = py.detach(|| self.encode_ordinary(text));
+        self.tokens_into_pylist(py, &tokens)
     }
 
     #[pyo3(name = "encode")]
-    fn py_encode(
+    fn py_encode<'py>(
         &self,
-        py: Python,
+        py: Python<'py>,
         text: &str,
         allowed_special: HashSet<PyBackedStr>,
-    ) -> PyResult<Vec<Rank>> {
-        py.detach(|| {
+    ) -> PyResult<Bound<'py, PyList>> {
+        let tokens = py.detach(|| {
             let allowed_special: HashSet<&str> =
                 allowed_special.iter().map(|s| s.as_ref()).collect();
             match self.encode(text, &allowed_special) {
                 Ok((tokens, _)) => Ok(tokens),
                 Err(e) => Err(PyErr::new::<exceptions::PyValueError, _>(e.message)),
             }
-        })
+        })?;
+        self.tokens_into_pylist(py, &tokens)
     }
 
     fn encode_to_tiktoken_buffer(
