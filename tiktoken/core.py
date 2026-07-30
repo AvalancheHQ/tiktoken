@@ -54,6 +54,15 @@ class Encoding:
         # Contains on set is significantly faster than on dict_values
         self._special_token_values = set(self._special_tokens.values())
 
+        # The special-token *names*, as an immutable set built once here.
+        # Every `encode`-family call has to resolve `allowed_special` /
+        # `disallowed_special` against this set, and building it (plus the
+        # `frozenset` the disallowed-special regex is keyed on) per call is a
+        # fixed, allocation-heavy cost paid on every call regardless of input
+        # size. A `frozenset` is used so it can be handed straight to
+        # `_special_token_regex`'s cache without being copied again.
+        self._special_tokens_frozen = frozenset(self._special_tokens)
+
         self._core_bpe = _tiktoken.CoreBPE(mergeable_ranks, special_tokens, pat_str)
 
     def __repr__(self) -> str:
@@ -114,9 +123,16 @@ class Encoding:
         ```
         """
         if allowed_special == "all":
-            allowed_special = self.special_tokens_set
+            allowed_special = self._special_tokens_frozen
         if disallowed_special == "all":
-            disallowed_special = self.special_tokens_set - allowed_special
+            # `_special_tokens_frozen` is already a `frozenset`, so when nothing
+            # is allowed (the default) this needs no set arithmetic at all and
+            # the `frozenset(...)` conversion below is a no-op.
+            disallowed_special = (
+                self._special_tokens_frozen - allowed_special
+                if allowed_special
+                else self._special_tokens_frozen
+            )
         if disallowed_special:
             if not isinstance(disallowed_special, frozenset):
                 disallowed_special = frozenset(disallowed_special)
@@ -147,9 +163,16 @@ class Encoding:
         Avoids the overhead of copying the token buffer into a Python list.
         """
         if allowed_special == "all":
-            allowed_special = self.special_tokens_set
+            allowed_special = self._special_tokens_frozen
         if disallowed_special == "all":
-            disallowed_special = self.special_tokens_set - allowed_special
+            # `_special_tokens_frozen` is already a `frozenset`, so when nothing
+            # is allowed (the default) this needs no set arithmetic at all and
+            # the `frozenset(...)` conversion below is a no-op.
+            disallowed_special = (
+                self._special_tokens_frozen - allowed_special
+                if allowed_special
+                else self._special_tokens_frozen
+            )
         if disallowed_special:
             if not isinstance(disallowed_special, frozenset):
                 disallowed_special = frozenset(disallowed_special)
@@ -193,9 +216,16 @@ class Encoding:
         ```
         """
         if allowed_special == "all":
-            allowed_special = self.special_tokens_set
+            allowed_special = self._special_tokens_frozen
         if disallowed_special == "all":
-            disallowed_special = self.special_tokens_set - allowed_special
+            # `_special_tokens_frozen` is already a `frozenset`, so when nothing
+            # is allowed (the default) this needs no set arithmetic at all and
+            # the `frozenset(...)` conversion below is a no-op.
+            disallowed_special = (
+                self._special_tokens_frozen - allowed_special
+                if allowed_special
+                else self._special_tokens_frozen
+            )
         if not isinstance(disallowed_special, frozenset):
             disallowed_special = frozenset(disallowed_special)
 
@@ -231,9 +261,16 @@ class Encoding:
         ```
         """
         if allowed_special == "all":
-            allowed_special = self.special_tokens_set
+            allowed_special = self._special_tokens_frozen
         if disallowed_special == "all":
-            disallowed_special = self.special_tokens_set - allowed_special
+            # `_special_tokens_frozen` is already a `frozenset`, so when nothing
+            # is allowed (the default) this needs no set arithmetic at all and
+            # the `frozenset(...)` conversion below is a no-op.
+            disallowed_special = (
+                self._special_tokens_frozen - allowed_special
+                if allowed_special
+                else self._special_tokens_frozen
+            )
         if disallowed_special:
             if not isinstance(disallowed_special, frozenset):
                 disallowed_special = frozenset(disallowed_special)
