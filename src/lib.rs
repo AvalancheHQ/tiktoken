@@ -315,6 +315,37 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+/// Tracks how the thread-local regex slots are being used, so that the full set
+/// is only materialised once the tokeniser is actually shared between threads.
+/// See `CoreBPE::_thread_regex_slot`.
+#[derive(Debug)]
+struct SlotState {
+    /// Slot of the first thread that asked for a regex, or `usize::MAX` if none
+    /// has yet.
+    first_slot: std::sync::atomic::AtomicUsize,
+    /// Whether every slot has been compiled.
+    filled: std::sync::atomic::AtomicBool,
+}
+
+impl SlotState {
+    fn new() -> Self {
+        Self {
+            first_slot: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            filled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl Clone for SlotState {
+    fn clone(&self) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        Self {
+            first_slot: std::sync::atomic::AtomicUsize::new(self.first_slot.load(Relaxed)),
+            filled: std::sync::atomic::AtomicBool::new(self.filled.load(Relaxed)),
+        }
+    }
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -329,21 +360,75 @@ pub struct CoreBPE {
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
-    regex_tls: Vec<Regex>,
-    special_regex_tls: Vec<Regex>,
+    // The two patterns, kept so that thread-local regex slots can be compiled on
+    // demand instead of all at once in the constructor.
+    pattern: String,
+    special_pattern: String,
+    regex_tls: Vec<std::sync::OnceLock<Regex>>,
+    special_regex_tls: Vec<std::sync::OnceLock<Regex>>,
+    slot_state: SlotState,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
 
 impl CoreBPE {
-    fn _get_tl_regex(&self) -> &Regex {
+    /// Returns this thread's regex slot, compiling the whole set of slots the
+    /// first time the tokeniser is used from a second thread.
+    ///
+    /// Compiling the split pattern is by far the most expensive thing a `CoreBPE`
+    /// does — 128 of them plus 128 special-token patterns used to dominate
+    /// construction — yet a single-threaded program only ever reads one slot.
+    /// So slots start empty and are compiled when first used. As soon as a second
+    /// thread appears we fill in every remaining slot in one go: a multi-threaded
+    /// program then finds every slot ready (as it did when the constructor
+    /// compiled them all), so threads never compile on their own and never share a
+    /// `Regex` — and so never contend on its `regex-automata` scratch pool.
+    fn _thread_regex_slot(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         // See performance notes above for what this is about
         // It's also a little janky, please make a better version of it!
         // However, it's nice that this doesn't leak memory to short-lived threads
-        &self.regex_tls[hash_current_thread() % MAX_NUM_THREADS]
+        let slot = hash_current_thread() % MAX_NUM_THREADS;
+        if !self.slot_state.filled.load(Relaxed) {
+            match self.slot_state.first_slot.load(Relaxed) {
+                usize::MAX => self.slot_state.first_slot.store(slot, Relaxed),
+                first if first != slot => self._fill_regex_slots(),
+                _ => {}
+            }
+        }
+        slot
+    }
+
+    /// Compiles every thread-local slot, so later threads find them ready.
+    #[cold]
+    fn _fill_regex_slots(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        for slot in &self.regex_tls {
+            slot.get_or_init(|| self._compile_pattern());
+        }
+        for slot in &self.special_regex_tls {
+            slot.get_or_init(|| self._compile_special_pattern());
+        }
+        self.slot_state.filled.store(true, Relaxed);
+    }
+
+    // Both patterns compiled successfully in `new_internal` and compiling them is
+    // deterministic, so these cannot fail.
+    fn _compile_pattern(&self) -> Regex {
+        Regex::new(&self.pattern).expect("split pattern was validated at construction")
+    }
+
+    fn _compile_special_pattern(&self) -> Regex {
+        Regex::new(&self.special_pattern).expect("special pattern was validated at construction")
+    }
+
+    fn _get_tl_regex(&self) -> &Regex {
+        let slot = self._thread_regex_slot();
+        self.regex_tls[slot].get_or_init(|| self._compile_pattern())
     }
 
     fn _get_tl_special_regex(&self) -> &Regex {
-        &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
+        let slot = self._thread_regex_slot();
+        self.special_regex_tls[slot].get_or_init(|| self._compile_special_pattern())
     }
 
     /// Resolves a token id to its decoded bytes, checking the regular decoder
@@ -683,17 +768,25 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
-        // Compile an independent regex per thread-local slot instead of cloning one. Cloning a
-        // `fancy_regex::Regex` shares an `Arc<Prog>` whose regex-automata engines keep their scratch
-        // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
-        // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
-        // lock-free path), paying the compile cost once at construction rather than on the hot path.
-        let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
-            .collect::<Result<Vec<_>, _>>()?;
-        let special_regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(&special_pattern))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Each thread-local slot gets its own independently compiled regex rather than a clone.
+        // Cloning a `fancy_regex::Regex` shares an `Arc<Prog>` whose regex-automata engines keep
+        // their scratch in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow
+        // path during multi-threaded batch encoding. Compiling per slot gives each thread its own
+        // pool (fast, lock-free path).
+        //
+        // The slots are compiled on demand (see `_thread_regex_slot`) instead of here: compiling
+        // these two patterns 128 times each costs more than everything else in this constructor put
+        // together, and a single-threaded program — the common case — only ever uses one slot. Both
+        // patterns are still compiled once now, so an invalid pattern is still rejected here, as
+        // `new`'s signature promises.
+        let regex_tls: Vec<std::sync::OnceLock<Regex>> = (0..MAX_NUM_THREADS)
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
+        let special_regex_tls: Vec<std::sync::OnceLock<Regex>> = (0..MAX_NUM_THREADS)
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
+        regex_tls[0].set(Regex::new(pattern)?).ok();
+        special_regex_tls[0].set(Regex::new(&special_pattern)?).ok();
 
         Ok(Self {
             encoder,
@@ -701,8 +794,11 @@ impl CoreBPE {
             decoder,
             special_tokens_decoder,
             decoder_flat,
+            pattern: pattern.to_string(),
+            special_pattern,
             regex_tls,
             special_regex_tls,
+            slot_state: SlotState::new(),
             sorted_token_bytes,
         })
     }
