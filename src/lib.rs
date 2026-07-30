@@ -327,6 +327,8 @@ const MAX_NUM_THREADS: usize = 128;
 //
 // The cache is sharded by thread the same way the regexes are, so concurrent encoders normally get
 // their own shard and never contend, and each shard is capped so the memory it can hold is bounded.
+// A shard is claimed once per `encode`/`encode_ordinary` call rather than once per piece, so the
+// hot loop pays nothing but the hash lookup itself.
 
 /// Number of independent cache shards. A thread picks one from its id, as it does for the
 /// thread-local regexes, so concurrent encoders rarely touch the same shard.
@@ -340,7 +342,8 @@ const PIECE_CACHE_CAPACITY: usize = 1024;
 /// disproportionately expensive to store and hash.
 const PIECE_CACHE_MAX_PIECE_LEN: usize = 32;
 
-type PieceCache = Vec<Mutex<HashMap<Box<[u8]>, Box<[Rank]>>>>;
+type PieceCacheShard = HashMap<Box<[u8]>, Box<[Rank]>>;
+type PieceCache = Vec<Mutex<PieceCacheShard>>;
 
 fn new_piece_cache() -> Arc<PieceCache> {
     Arc::new(
@@ -385,35 +388,46 @@ impl CoreBPE {
         &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
     }
 
+    /// Claims this thread's piece-cache shard for the duration of one encode call.
+    ///
+    /// The shard is picked from the thread id the same way the thread-local regexes are, so
+    /// concurrent encoders normally get a shard of their own. `try_lock` keeps the claim cheap and
+    /// never blocks: if two threads do land on the same shard, or a previous panic poisoned it, the
+    /// loser simply encodes without the memo instead of waiting.
+    ///
+    /// Claiming once per call, instead of once per piece, keeps the per-piece cost down to the hash
+    /// lookup itself.
+    fn lock_piece_cache(&self) -> Option<std::sync::MutexGuard<'_, PieceCacheShard>> {
+        self.piece_cache[hash_current_thread() % PIECE_CACHE_SHARDS]
+            .try_lock()
+            .ok()
+    }
+
     /// Appends the tokens of `piece` — which is known not to be a token itself — to `out` and
     /// returns how many were appended.
     ///
-    /// The merges are looked up in the piece cache first, so a piece that has already been seen
-    /// costs one hash lookup and a copy instead of a full `byte_pair_encode`.
-    fn byte_pair_encode_cached(&self, piece: &[u8], out: &mut Vec<Rank>) -> usize {
-        if piece.len() > PIECE_CACHE_MAX_PIECE_LEN {
+    /// The merges are looked up in `cache` first (when this thread claimed a shard), so a piece
+    /// that has already been seen costs one hash lookup and a copy instead of a full
+    /// `byte_pair_encode`.
+    fn byte_pair_encode_cached(
+        &self,
+        piece: &[u8],
+        cache: Option<&mut PieceCacheShard>,
+        out: &mut Vec<Rank>,
+    ) -> usize {
+        let Some(cache) = cache.filter(|_| piece.len() <= PIECE_CACHE_MAX_PIECE_LEN) else {
             let tokens = byte_pair_encode(piece, &self.encoder);
             out.extend_from_slice(&tokens);
             return tokens.len();
+        };
+
+        if let Some(tokens) = cache.get(piece) {
+            out.extend_from_slice(tokens);
+            return tokens.len();
         }
 
-        let shard = &self.piece_cache[hash_current_thread() % PIECE_CACHE_SHARDS];
-        {
-            // Poisoning cannot make the memo wrong (a poisoned shard just holds correct entries
-            // written before some unrelated panic), so recover from it instead of propagating.
-            let cache = shard.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(tokens) = cache.get(piece) {
-                out.extend_from_slice(tokens);
-                return tokens.len();
-            }
-        }
-
-        // Merge outside the lock, so a shard shared by two threads never makes one wait for the
-        // other's merge.
         let tokens = byte_pair_encode(piece, &self.encoder);
         out.extend_from_slice(&tokens);
-
-        let mut cache = shard.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() < PIECE_CACHE_CAPACITY {
             cache.insert(piece.into(), tokens.as_slice().into());
         }
@@ -453,13 +467,14 @@ impl CoreBPE {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
         let regex = self._get_tl_regex();
+        let mut piece_cache = self.lock_piece_cache();
         let mut ret = vec![];
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => {
-                    self.byte_pair_encode_cached(piece, &mut ret);
+                    self.byte_pair_encode_cached(piece, piece_cache.as_deref_mut(), &mut ret);
                 }
             }
         }
@@ -473,6 +488,7 @@ impl CoreBPE {
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let regex = self._get_tl_regex();
+        let mut piece_cache = self.lock_piece_cache();
         let mut ret = vec![];
 
         let mut start = 0;
@@ -512,7 +528,8 @@ impl CoreBPE {
                     ret.push(*token);
                     continue;
                 }
-                last_piece_token_len = self.byte_pair_encode_cached(piece, &mut ret);
+                last_piece_token_len =
+                    self.byte_pair_encode_cached(piece, piece_cache.as_deref_mut(), &mut ret);
             }
 
             match next_special {
