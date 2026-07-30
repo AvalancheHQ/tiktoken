@@ -259,6 +259,262 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
+/// The tokeniser split patterns tiktoken ships, recognised verbatim.
+///
+/// Splitting is ~85% of encoding time: both patterns use possessive quantifiers
+/// and the `\s+(?!\S)` lookahead, so `fancy_regex` runs them on its backtracking
+/// VM — one VM run, with its own allocations and delegate searches, per token.
+/// Knowing which pattern we are splitting with lets [`fast_piece_end`] decide
+/// the common pieces with a plain byte scan instead.
+///
+/// `r50k_base`/`p50k_base`/`p50k_edit`/`gpt2` share `R50K_PATTERN`.
+const R50K_PATTERN: &str =
+    r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+/// `cl100k_base`.
+const CL100K_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+
+/// Which split pattern a `CoreBPE` was built with, if it is one we recognise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternFamily {
+    /// Not a pattern we know: no fast path, `fancy_regex` does all the work.
+    Unknown,
+    R50k,
+    Cl100k,
+}
+
+impl PatternFamily {
+    fn of(pattern: &str) -> Self {
+        if pattern == R50K_PATTERN {
+            PatternFamily::R50k
+        } else if pattern == CL100K_PATTERN {
+            PatternFamily::Cl100k
+        } else {
+            PatternFamily::Unknown
+        }
+    }
+}
+
+/// True for the ASCII characters `\s` matches (`\s` is `\p{White_Space}`; every
+/// other member is non-ASCII).
+#[inline]
+const fn is_ascii_space(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ')
+}
+
+/// True for the ASCII characters in `[^\s\p{L}\p{N}]`.
+#[inline]
+const fn is_ascii_symbol(b: u8) -> bool {
+    b.is_ascii() && !b.is_ascii_alphanumeric() && !is_ascii_space(b)
+}
+
+/// End of the maximal ASCII letter run at `i`, or `None` if it is cut short by a
+/// non-ASCII byte that could extend it (a letter, or a mark for some patterns).
+#[inline]
+fn ascii_letter_run(bytes: &[u8], mut i: usize) -> Option<usize> {
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    (i >= bytes.len() || bytes[i].is_ascii()).then_some(i)
+}
+
+/// End of the maximal ASCII digit run at `i`, capped at `max_len` digits, or
+/// `None` if a shorter-than-cap run is cut short by a non-ASCII byte that could
+/// be another `\p{N}`.
+#[inline]
+fn ascii_digit_run(bytes: &[u8], start: usize, max_len: usize) -> Option<usize> {
+    let mut i = start;
+    while i < bytes.len() && i - start < max_len && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    (i - start == max_len || i >= bytes.len() || bytes[i].is_ascii()).then_some(i)
+}
+
+/// End of the maximal `[^\s\p{L}\p{N}]` run at `i` followed by `[\r\n]*` when
+/// `line_breaks` is set, or `None` if the run is cut short by a non-ASCII byte
+/// that could belong to the class.
+#[inline]
+fn ascii_symbol_run(bytes: &[u8], mut i: usize, line_breaks: bool) -> Option<usize> {
+    while i < bytes.len() && is_ascii_symbol(bytes[i]) {
+        i += 1;
+    }
+    if i < bytes.len() && !bytes[i].is_ascii() {
+        return None;
+    }
+    if line_breaks {
+        while i < bytes.len() && matches!(bytes[i], b'\r' | b'\n') {
+            i += 1;
+        }
+    }
+    Some(i)
+}
+
+/// End offset of the piece starting at `start`, when it can be determined
+/// without running the regex, or `None` to let `fancy_regex` decide.
+///
+/// This resolves the alternation by hand for the pieces that dominate real
+/// text — letter runs, digit runs and symbol runs, each optionally preceded by
+/// the character the pattern's alternative absorbs — and gives up on everything
+/// else, so `fancy_regex` remains the source of truth. Both families are read
+/// alternative by alternative, in the order the VM tries them:
+///
+/// * `R50K_PATTERN`: `'(?:[sdmt]|ll|ve|re)` needs a `'`, so a piece that does
+///   not start with one is decided by ` ?\p{L}++`, ` ?\p{N}++` or
+///   ` ?[^\s\p{L}\p{N}]++`, each an atomic maximal run with an optional leading
+///   space. A whitespace-led piece other than `space + non-whitespace` is left
+///   to the regex (`\s++$`, `\s+(?!\S)`, `\s`).
+/// * `CL100K_PATTERN`: same shape, except that the letter alternative absorbs
+///   any non-line-break non-alphanumeric character as a prefix
+///   (`[^\r\n\p{L}\p{N}]?+\p{L}++`), digits are capped at three
+///   (`\p{N}{1,3}+`), the symbol alternative also swallows trailing line breaks
+///   (` ?[^\s\p{L}\p{N}]++[\r\n]*+`), and `space + digit` matches the trailing
+///   bare `\s` (a single space) because every alternative in between fails.
+///
+/// Anything involving a non-ASCII byte bails out: whether such a byte extends a
+/// run is a question about Unicode character classes, which is the regex's job.
+/// A leading `'` also bails, since the contraction alternative can match just
+/// part of a letter run (`'ss` -> `'s`).
+#[inline]
+fn fast_piece_end(family: PatternFamily, bytes: &[u8], start: usize) -> Option<usize> {
+    let first = *bytes.get(start)?;
+    if first.is_ascii_alphabetic() {
+        return ascii_letter_run(bytes, start);
+    }
+    if !first.is_ascii() || first == b'\'' {
+        return None;
+    }
+    let cl100k = match family {
+        PatternFamily::Cl100k => true,
+        PatternFamily::R50k => false,
+        PatternFamily::Unknown => return None,
+    };
+
+    if first.is_ascii_digit() {
+        return ascii_digit_run(bytes, start, if cl100k { 3 } else { usize::MAX });
+    }
+
+    // A single character can be absorbed as the prefix of the piece that starts
+    // at `start + 1`: a space for r50k, anything but a line break for cl100k.
+    let prefix = if cl100k {
+        !matches!(first, b'\r' | b'\n')
+    } else {
+        first == b' '
+    };
+    // When nothing follows the prefix every alternative that could absorb it
+    // fails, so fall through to the unprefixed handling below.
+    if let (true, Some(&next)) = (prefix, bytes.get(start + 1)) {
+        if !next.is_ascii() {
+            return None;
+        }
+        if next.is_ascii_alphabetic() {
+            return ascii_letter_run(bytes, start + 1);
+        }
+        if first == b' ' {
+            if next.is_ascii_digit() {
+                return if cl100k {
+                    // ` ?[^\s\p{L}\p{N}]++…` cannot start with a digit and the
+                    // whitespace alternatives all need more whitespace or the
+                    // end of the text, so the trailing bare `\s` wins.
+                    Some(start + 1)
+                } else {
+                    ascii_digit_run(bytes, start + 1, usize::MAX)
+                };
+            }
+            if !is_ascii_space(next) {
+                return ascii_symbol_run(bytes, start + 1, cl100k);
+            }
+        }
+    }
+    if is_ascii_space(first) {
+        // Whitespace runs are the regex's business.
+        return None;
+    }
+    ascii_symbol_run(bytes, start, cl100k)
+}
+
+/// The pieces of `text`, as `regex.find_iter(text)` would yield them.
+///
+/// For a recognised [`PatternFamily`] the common pieces are recognised by
+/// [`fast_piece_end`] and every other position is handed to `fancy_regex`,
+/// which stays the source of truth. For an unrecognised pattern this is
+/// `find_iter` verbatim.
+enum Pieces<'a> {
+    Fancy(fancy_regex::Matches<'a, 'a>),
+    Fast {
+        text: &'a str,
+        regex: &'a Regex,
+        family: PatternFamily,
+        pos: usize,
+    },
+}
+
+impl<'a> Pieces<'a> {
+    fn new(regex: &'a Regex, family: PatternFamily, text: &'a str) -> Self {
+        match family {
+            PatternFamily::Unknown => Pieces::Fancy(regex.find_iter(text)),
+            _ => Pieces::Fast {
+                text,
+                regex,
+                family,
+                pos: 0,
+            },
+        }
+    }
+}
+
+impl<'a> Iterator for Pieces<'a> {
+    type Item = fancy_regex::Result<&'a str>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Pieces::Fancy(matches) => matches.next().map(|m| m.map(|m| m.as_str())),
+            Pieces::Fast {
+                text,
+                regex,
+                family,
+                pos,
+            } => {
+                if *pos >= text.len() {
+                    return None;
+                }
+                if let Some(end) = fast_piece_end(*family, text.as_bytes(), *pos) {
+                    let piece = &text[*pos..end];
+                    *pos = end;
+                    return Some(Ok(piece));
+                }
+                match regex.find_from_pos(text, *pos) {
+                    Ok(Some(m)) => {
+                        // Every alternative of the recognised patterns consumes
+                        // at least one character, but stay safe against a
+                        // zero-width match spinning forever.
+                        *pos = if m.end() > m.start() {
+                            m.end()
+                        } else {
+                            m.end() + codepoint_len_at(text, m.end())
+                        };
+                        Some(Ok(m.as_str()))
+                    }
+                    Ok(None) => {
+                        *pos = text.len();
+                        None
+                    }
+                    Err(e) => {
+                        *pos = text.len();
+                        Some(Err(e))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Length in bytes of the UTF-8 code point starting at `ix`, or 1 at the end of
+/// the string (only used to make forward progress).
+#[inline]
+fn codepoint_len_at(text: &str, ix: usize) -> usize {
+    text[ix..].chars().next().map_or(1, char::len_utf8)
+}
+
 struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -332,6 +588,10 @@ pub struct CoreBPE {
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
+    // Which of the shipped split patterns this tokeniser uses, if any. Lets the
+    // splitter recognise the common pieces with a byte scan instead of a
+    // `fancy_regex` VM run; see `Pieces` and `fast_piece_end`.
+    pattern_family: PatternFamily,
 }
 
 impl CoreBPE {
@@ -380,8 +640,8 @@ impl CoreBPE {
         // just make things complicated :-)
         let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        for piece in Pieces::new(regex, self.pattern_family, text) {
+            let piece = piece.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -420,9 +680,9 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
+            for piece_res in Pieces::new(regex, self.pattern_family, &text[start..end]) {
+                let piece = match piece_res {
+                    Ok(piece) => piece.as_bytes(),
                     Err(e) => {
                         return Err(EncodeError {
                             message: format!("Regex error while tokenizing: {e}"),
@@ -430,7 +690,6 @@ impl CoreBPE {
                     }
                 };
 
-                let piece = mat.as_str().as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
                     ret.push(*token);
@@ -704,6 +963,7 @@ impl CoreBPE {
             regex_tls,
             special_regex_tls,
             sorted_token_bytes,
+            pattern_family: PatternFamily::of(pattern),
         })
     }
 
@@ -725,7 +985,7 @@ mod tests {
     use fancy_regex::Regex;
     use rustc_hash::FxHashMap as HashMap;
 
-    use crate::{Rank, byte_pair_split};
+    use crate::{CL100K_PATTERN, PatternFamily, Pieces, R50K_PATTERN, Rank, byte_pair_split};
 
     fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
         HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
@@ -743,5 +1003,148 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    /// Pieces as `fancy_regex` alone would produce them.
+    fn fancy_pieces<'a>(regex: &Regex, text: &'a str) -> Vec<&'a str> {
+        regex.find_iter(text).map(|m| m.unwrap().as_str()).collect()
+    }
+
+    /// Pieces as the fast splitter produces them.
+    fn fast_pieces<'a>(regex: &'a Regex, family: PatternFamily, text: &'a str) -> Vec<&'a str> {
+        Pieces::new(regex, family, text)
+            .map(|piece| piece.unwrap())
+            .collect()
+    }
+
+    fn assert_same_pieces(pattern: &str, texts: &[String]) {
+        let regex = Regex::new(pattern).unwrap();
+        let family = PatternFamily::of(pattern);
+        assert_ne!(family, PatternFamily::Unknown, "pattern not recognised");
+        for text in texts {
+            assert_eq!(
+                fast_pieces(&regex, family, text),
+                fancy_pieces(&regex, text),
+                "split mismatch for {text:?} with pattern {pattern}"
+            );
+        }
+    }
+
+    fn tricky_texts() -> Vec<String> {
+        [
+            "",
+            " ",
+            "  ",
+            "   word",
+            "hello world",
+            "The quick brown fox jumps over the lazy dog.",
+            "don't 'ss 's 'sss 'll 'LL 'x '",
+            "(BPE) is a way\tof.Net converting\r\ntext",
+            "a1b2c3 123 1234 12345 007",
+            "trailing spaces   ",
+            "\n\n\n",
+            " \n \r\n\t\u{b}\u{c}",
+            "caf\u{e9} na\u{ef}ve \u{e9}t\u{e9}",
+            "e\u{301}mile", // letter + combining mark
+            "\u{4f60}\u{597d}\u{4e16}\u{754c} hello",
+            "emoji \u{1f600}\u{1f469}\u{200d}\u{1f4bb} tail",
+            "\u{a0}nbsp \u{2000}space",
+            "MiXeD CaSe HELLO Hello",
+            "under_score kebab-case snake_case",
+            "\"quoted\" (parens) [brackets] {braces}",
+            "http://example.com/path?q=1&r=2",
+            "tabs\tbetween\twords",
+            "\u{2019}s curly quote",
+            "a",
+            " a",
+            ".a",
+            "'a",
+            "\ra",
+            "\na",
+            "1a",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// Deterministic pseudo-random strings over an alphabet that stresses every
+    /// character class the patterns care about.
+    fn random_texts(count: usize, max_len: usize) -> Vec<String> {
+        const ALPHABET: &[char] = &[
+            'a',
+            'b',
+            'Z',
+            'q',
+            '0',
+            '7',
+            ' ',
+            ' ',
+            '\t',
+            '\n',
+            '\r',
+            '.',
+            ',',
+            '\'',
+            '-',
+            '(',
+            '/',
+            '"',
+            '_',
+            '9',
+            ' ',
+            '\u{b}',
+            '\u{c}',
+            '\0',
+            '\u{e9}',
+            '\u{4f60}',
+            '\u{301}',
+            '\u{1f600}',
+            '\u{a0}',
+            '\u{2019}',
+            '\u{660}',
+            '\u{2160}',
+        ];
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            // xorshift64*
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        (0..count)
+            .map(|_| {
+                let len = (next() as usize) % (max_len + 1);
+                (0..len)
+                    .map(|_| ALPHABET[(next() as usize) % ALPHABET.len()])
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_fast_split_matches_fancy_regex() {
+        let texts = tricky_texts();
+        assert_same_pieces(R50K_PATTERN, &texts);
+        assert_same_pieces(CL100K_PATTERN, &texts);
+
+        let random = random_texts(3000, 24);
+        assert_same_pieces(R50K_PATTERN, &random);
+        assert_same_pieces(CL100K_PATTERN, &random);
+    }
+
+    #[test]
+    fn test_unknown_pattern_has_no_fast_path() {
+        // o200k's letter alternative absorbs a trailing contraction, so it must
+        // not be treated as a known family.
+        let o200k = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}|\s+";
+        assert_eq!(PatternFamily::of(o200k), PatternFamily::Unknown);
+        let regex = Regex::new(o200k).unwrap();
+        let text = "it's a test";
+        assert_eq!(
+            fast_pieces(&regex, PatternFamily::Unknown, text),
+            fancy_pieces(&regex, text)
+        );
     }
 }
