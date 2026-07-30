@@ -9,8 +9,13 @@ ENDOFPROMPT = "<|endofprompt|>"
 # The pattern in the original GPT-2 release is:
 # r"""'s|'t|'re|'ve|'m|'ll|'d| ?[\p{L}]+| ?[\p{N}]+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 # This is equivalent, but executes faster:
+# Note: the quantifiers here are deliberately *not* possessive. Every branch ends right after
+# its quantifier, so greedy and possessive matching accept exactly the same pieces, but a
+# possessive quantifier is an atomic group, which `fancy_regex` (the engine used by the Rust
+# core) can only run on its backtracking VM instead of delegating the whole branch to an
+# automaton. Keeping them greedy makes the split substantially cheaper.
 r50k_pat_str = (
-    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"""
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+$|\s+(?!\S)|\s"""
 )
 
 
@@ -86,7 +91,8 @@ def cl100k_base():
     }
     return {
         "name": "cl100k_base",
-        "pat_str": r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s""",
+        # See the note on `r50k_pat_str`: the quantifiers are deliberately greedy, not possessive.
+        "pat_str": r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s+$|\s*[\r\n]|\s+(?!\S)|\s""",
         "mergeable_ranks": mergeable_ranks,
         "special_tokens": special_tokens,
     }
