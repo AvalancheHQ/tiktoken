@@ -14,6 +14,25 @@ pub type Rank = u32;
 
 use std::collections::BinaryHeap;
 
+/// A source of token ranks, so the merge routines can run either straight on the
+/// vocabulary map or on the faster inline-key view of it (see `Vocab`).
+trait RankLookup {
+    fn rank(&self, bytes: &[u8]) -> Option<Rank>;
+
+    /// The rank of `bytes`, or `Rank::MAX` when it is not a token.
+    #[inline(always)]
+    fn rank_or_max(&self, bytes: &[u8]) -> Rank {
+        self.rank(bytes).unwrap_or(Rank::MAX)
+    }
+}
+
+impl RankLookup for HashMap<Vec<u8>, Rank> {
+    #[inline(always)]
+    fn rank(&self, bytes: &[u8]) -> Option<Rank> {
+        self.get(bytes).copied()
+    }
+}
+
 #[derive(Eq, PartialEq, Clone, Copy)]
 struct Merge {
     start: usize,
@@ -44,7 +63,7 @@ struct State {
     cur_rank: Rank,
 }
 
-fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<Rank> {
+fn _byte_pair_merge_large<R: RankLookup + ?Sized>(ranks: &R, piece: &[u8]) -> Vec<Rank> {
     let mut state = Vec::with_capacity(piece.len());
     state.push(State {
         prev: usize::MAX,
@@ -56,7 +75,7 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
 
     let mut heap = BinaryHeap::with_capacity(piece.len());
     for i in 0..piece.len() - 1 {
-        if let Some(&rank) = ranks.get(&piece[i..i + 2]) {
+        if let Some(rank) = ranks.rank(&piece[i..i + 2]) {
             heap.push(Merge { start: i, rank });
             state[i].next_rank = rank;
         }
@@ -85,7 +104,7 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
             state[start].next_end = next_end_item;
             state[start].next_rank = Rank::MAX; // Always invalidate the old merge
             if next_end_item <= piece.len()
-                && let Some(&rank) = ranks.get(&piece[start..next_end_item])
+                && let Some(rank) = ranks.rank(&piece[start..next_end_item])
             {
                 // We have a valid potential merge!
                 heap.push(Merge { start, rank });
@@ -130,14 +149,14 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
         if state[i].cur_rank != Rank::MAX {
             result.push(state[i].cur_rank);
         } else {
-            result.push(ranks[&piece[i..state[i].end]]);
+            result.push(ranks.rank(&piece[i..state[i].end]).unwrap());
         }
         i = state[i].end;
     }
     result
 }
 
-fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
+fn _byte_pair_merge<R: RankLookup + ?Sized>(ranks: &R, piece: &[u8]) -> Vec<(usize, Rank)> {
     // This is a vector of (start, rank).
     // The rank is of the pair starting at position start.
     let mut parts = Vec::with_capacity(piece.len() + 1);
@@ -147,7 +166,7 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
     // merge priority from token index or to prevent specific token merges.
     let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
     for i in 0..piece.len() - 1 {
-        let rank = *ranks.get(&piece[i..i + 2]).unwrap_or(&Rank::MAX);
+        let rank = ranks.rank_or_max(&piece[i..i + 2]);
         if rank < min_rank.0 {
             min_rank = (rank, i);
         }
@@ -162,9 +181,7 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
             if (i + 3) < parts.len() {
                 // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
                 // parts[i + 1], see comment in the main loop.
-                *ranks
-                    .get(&piece[parts[i].0..parts[i + 3].0])
-                    .unwrap_or(&Rank::MAX)
+                ranks.rank_or_max(&piece[parts[i].0..parts[i + 3].0])
             } else {
                 Rank::MAX
             }
@@ -196,15 +213,19 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+    _byte_pair_encode_with(piece, ranks)
+}
+
+fn _byte_pair_encode_with<R: RankLookup + ?Sized>(piece: &[u8], ranks: &R) -> Vec<Rank> {
     let piece_len = piece.len();
 
     if piece_len == 1 {
-        return vec![ranks[piece]];
+        return vec![ranks.rank(piece).unwrap()];
     }
     if piece_len < 100 {
         return _byte_pair_merge(ranks, piece)
             .windows(2)
-            .map(|part| ranks[&piece[part[0].0..part[1].0]])
+            .map(|part| ranks.rank(&piece[part[0].0..part[1].0]).unwrap())
             .collect();
     }
     _byte_pair_merge_large(ranks, piece)
@@ -315,6 +336,166 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+/// Longest token that the flat lookup table below stores inline.
+///
+/// A token of at most 15 bytes fits in a `u128` together with its length, which
+/// makes a lookup a single 16-byte load and compare.
+const MAX_INLINE_TOKEN_LEN: usize = 15;
+
+/// Packs at most 8 bytes into a `u64`, zero padded, without calling `memcpy`.
+///
+/// The padding is canonical (the unused high bytes are zero), so together with
+/// the length the result identifies the byte string uniquely.
+#[inline(always)]
+fn load_padded_u64(bytes: &[u8]) -> u64 {
+    debug_assert!(bytes.len() <= 8);
+    match bytes.len() {
+        8 => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        n => {
+            let mut value = 0u64;
+            let mut i = 0;
+            if n >= 4 {
+                value |= u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64;
+                i = 4;
+            }
+            if n - i >= 2 {
+                value |=
+                    (u16::from_le_bytes(bytes[i..i + 2].try_into().unwrap()) as u64) << (8 * i);
+                i += 2;
+            }
+            if n - i >= 1 {
+                value |= (bytes[i] as u64) << (8 * i);
+            }
+            value
+        }
+    }
+}
+
+/// Builds the inline key of a token of 1..=15 bytes.
+///
+/// Layout: bytes 0..8 of the token in the low `u64`, the remaining bytes (at
+/// most 7, zero padded) in the high `u64`, and the length in the top byte —
+/// which is always free because the high `u64` holds at most 7 bytes. A key is
+/// therefore never zero, so zero can mark an empty slot.
+#[inline(always)]
+fn inline_token_key(token: &[u8]) -> u128 {
+    debug_assert!(!token.is_empty() && token.len() <= MAX_INLINE_TOKEN_LEN);
+    let len = token.len();
+    let (low, high) = if len >= 8 {
+        (
+            u64::from_le_bytes(token[..8].try_into().unwrap()),
+            load_padded_u64(&token[8..]),
+        )
+    } else {
+        (load_padded_u64(token), 0)
+    };
+    (low as u128) | ((high as u128) << 64) | ((len as u128) << 120)
+}
+
+/// Flat, open-addressed table mapping short token bytes to their rank.
+///
+/// The vocabulary map (`FxHashMap<Vec<u8>, Rank>`) stores its keys out of line,
+/// so every piece lookup on the encode hot path pays a hash, a bucket load, a
+/// pointer dereference into the key's heap buffer and a `memcmp` call. Tokens of
+/// at most `MAX_INLINE_TOKEN_LEN` bytes — which is nearly the whole vocabulary
+/// and virtually every piece the tokeniser regex produces on real text — fit in
+/// a `u128` alongside their length, so this table keeps them inline: a lookup is
+/// one multiply, one 16-byte load and one 16-byte compare, with no indirection
+/// and no call.
+#[derive(Clone)]
+struct InlineTokenTable {
+    keys: Vec<u128>,
+    ranks: Vec<Rank>,
+    shift: u32,
+    mask: usize,
+}
+
+/// The vocabulary as seen by the encode hot path: short keys are answered by the
+/// inline-key table, everything else by the vocabulary map.
+struct Vocab<'a> {
+    table: Option<&'a InlineTokenTable>,
+    map: &'a HashMap<Vec<u8>, Rank>,
+}
+
+impl RankLookup for Vocab<'_> {
+    #[inline(always)]
+    fn rank(&self, bytes: &[u8]) -> Option<Rank> {
+        match self.table {
+            Some(table) if !bytes.is_empty() && bytes.len() <= MAX_INLINE_TOKEN_LEN => {
+                table.get(bytes)
+            }
+            _ => self.map.get(bytes).copied(),
+        }
+    }
+}
+
+impl InlineTokenTable {
+    /// Builds the table from the vocabulary, or returns `None` if two distinct
+    /// tokens ever pack to the same key (they cannot, but staying defensive
+    /// keeps the fast path from being able to return a wrong rank: callers fall
+    /// back to the vocabulary map when the table is absent).
+    fn build(encoder: &HashMap<Vec<u8>, Rank>) -> Option<Self> {
+        let short_tokens = encoder
+            .iter()
+            .filter(|(token, _)| !token.is_empty() && token.len() <= MAX_INLINE_TOKEN_LEN);
+        let count = short_tokens.clone().count();
+        let capacity = count.saturating_mul(2).next_power_of_two().max(16);
+        let bits = capacity.trailing_zeros();
+
+        let mut table = Self {
+            keys: vec![0; capacity],
+            ranks: vec![0; capacity],
+            shift: 64 - bits,
+            mask: capacity - 1,
+        };
+
+        for (token, &rank) in short_tokens {
+            let key = inline_token_key(token);
+            let mut slot = table.slot_of(key);
+            loop {
+                match table.keys[slot] {
+                    0 => {
+                        table.keys[slot] = key;
+                        table.ranks[slot] = rank;
+                        break;
+                    }
+                    // Two different tokens packed to the same key: the fast path
+                    // would be ambiguous, so refuse to build it.
+                    existing if existing == key => return None,
+                    _ => slot = (slot + 1) & table.mask,
+                }
+            }
+        }
+        Some(table)
+    }
+
+    #[inline(always)]
+    fn slot_of(&self, key: u128) -> usize {
+        const MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+        let low = key as u64;
+        let high = (key >> 64) as u64;
+        let hash = (low ^ high.rotate_left(32)).wrapping_mul(MULTIPLIER);
+        (hash >> self.shift) as usize
+    }
+
+    /// Looks up a token of 1..=`MAX_INLINE_TOKEN_LEN` bytes.
+    #[inline(always)]
+    fn get(&self, token: &[u8]) -> Option<Rank> {
+        let key = inline_token_key(token);
+        let mut slot = self.slot_of(key);
+        loop {
+            let candidate = self.keys[slot];
+            if candidate == key {
+                return Some(self.ranks[slot]);
+            }
+            if candidate == 0 {
+                return None;
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -329,6 +510,11 @@ pub struct CoreBPE {
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
+    // Inline-key view of every short token, used by the encode hot path to
+    // resolve a regex piece without dereferencing an out-of-line `Vec<u8>` key.
+    // `None` only if the table could not be built unambiguously, in which case
+    // every lookup goes through `encoder`.
+    inline_encoder: Option<InlineTokenTable>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
@@ -363,6 +549,18 @@ impl CoreBPE {
         }
     }
 
+    /// The vocabulary view used by the encode paths: short keys — nearly every
+    /// piece the tokeniser regex produces, and every key the BPE merge loop
+    /// probes on such a piece — are resolved from the inline-key table, which
+    /// covers all short tokens, so a miss there is a definitive miss.
+    #[inline(always)]
+    fn vocab(&self) -> Vocab<'_> {
+        Vocab {
+            table: self.inline_encoder.as_ref(),
+            map: &self.encoder,
+        }
+    }
+
     /// Decodes tokens into a list of bytes.
     ///
     /// The bytes are not gauranteed to be a valid utf-8 string.
@@ -379,12 +577,13 @@ impl CoreBPE {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
         let regex = self._get_tl_regex();
+        let vocab = self.vocab();
         let mut ret = vec![];
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
-            match self.encoder.get(piece) {
-                Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+            match vocab.rank(piece) {
+                Some(token) => ret.push(token),
+                None => ret.extend(&_byte_pair_encode_with(piece, &vocab)),
             }
         }
         ret
@@ -397,6 +596,7 @@ impl CoreBPE {
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
         let regex = self._get_tl_regex();
+        let vocab = self.vocab();
         let mut ret = vec![];
 
         let mut start = 0;
@@ -431,12 +631,12 @@ impl CoreBPE {
                 };
 
                 let piece = mat.as_str().as_bytes();
-                if let Some(token) = self.encoder.get(piece) {
+                if let Some(token) = vocab.rank(piece) {
                     last_piece_token_len = 1;
-                    ret.push(*token);
+                    ret.push(token);
                     continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
+                let tokens = _byte_pair_encode_with(piece, &vocab);
                 last_piece_token_len = tokens.len();
                 ret.extend(&tokens);
             }
@@ -679,6 +879,8 @@ impl CoreBPE {
             None => Vec::new(),
         };
 
+        let inline_encoder = InlineTokenTable::build(&encoder);
+
         // Clone because I don't know how to tell Rust I'm not going to change the map
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
@@ -701,6 +903,7 @@ impl CoreBPE {
             decoder,
             special_tokens_decoder,
             decoder_flat,
+            inline_encoder,
             regex_tls,
             special_regex_tls,
             sorted_token_bytes,
@@ -743,5 +946,61 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    #[test]
+    fn test_inline_token_table_matches_hash_map() {
+        // Tokens that stress the key packing: every inline length, NUL bytes,
+        // shared prefixes/suffixes and tokens too long for the table.
+        let mut tokens: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"\x00".to_vec(),
+            b"\x00\x00".to_vec(),
+            b"\x00a".to_vec(),
+            b"a\x00".to_vec(),
+            b"ab".to_vec(),
+            b"aab".to_vec(),
+            b"abb".to_vec(),
+            b"abcdefg".to_vec(),
+            b"abcdefgh".to_vec(),
+            b"abcdefghi".to_vec(),
+            b"abcdefghijklmn".to_vec(),
+            b"abcdefghijklmno".to_vec(),
+            b"abcdefghijklmnop".to_vec(),
+            b"abcdefghijklmnopqrstuvwxyz".to_vec(),
+        ];
+        for byte in 0u8..=255 {
+            tokens.push(vec![byte]);
+            tokens.push(vec![byte, byte]);
+            tokens.push(vec![b'x', byte, b'y']);
+        }
+        tokens.sort();
+        tokens.dedup();
+
+        let encoder: HashMap<Vec<u8>, Rank> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, token)| (token.clone(), i as Rank))
+            .collect();
+        let table = crate::InlineTokenTable::build(&encoder).expect("table should build");
+
+        // Every short token resolves to the same rank as the hash map.
+        for (token, &rank) in &encoder {
+            if !token.is_empty() && token.len() <= crate::MAX_INLINE_TOKEN_LEN {
+                assert_eq!(table.get(token), Some(rank), "token {token:?}");
+            }
+        }
+
+        // Byte strings that are not tokens are reported as missing.
+        for absent in [
+            b"zzz".to_vec(),
+            b"abcdefghz".to_vec(),
+            b"\x00\x00\x00".to_vec(),
+            b"abcdefghijklmn?".to_vec(),
+        ] {
+            assert!(!encoder.contains_key(&absent));
+            assert_eq!(table.get(&absent), None, "token {absent:?}");
+        }
     }
 }
