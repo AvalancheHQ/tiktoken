@@ -83,6 +83,27 @@ def test_decode(benchmark, encoding_name: str, size: str) -> None:
 
 
 @pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
+def test_construct_encoding(benchmark, encoding_name: str) -> None:
+    """Builds an ``Encoding`` from an already-loaded vocabulary.
+
+    This is what every process pays the first time it calls
+    ``tiktoken.get_encoding`` (or constructs a custom encoding), minus the
+    download and parsing of the vocabulary file, which is excluded by reusing
+    the ranks of an encoding that has already been loaded.
+    """
+    enc = _get_encoding(encoding_name)
+    construct = functools.partial(
+        tiktoken.Encoding,
+        name=f"{enc.name}-bench",
+        pat_str=enc._pat_str,
+        mergeable_ranks=enc._mergeable_ranks,
+        special_tokens=enc._special_tokens,
+    )
+    result = benchmark(construct)
+    assert result.n_vocab == enc.n_vocab
+
+
+@pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
 def test_encode_ordinary_batch(benchmark, encoding_name: str) -> None:
     enc = _get_encoding(encoding_name)
     documents = [TEXT_SIZES["medium"]] * 64
