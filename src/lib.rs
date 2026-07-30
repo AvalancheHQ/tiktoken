@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use fancy_regex::Regex;
@@ -315,6 +316,40 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+// Memoisation of the byte-pair merges
+// ==================================
+// A piece that is not itself a token has to be merged by `byte_pair_encode`, which costs on the
+// order of `O(len^2)` vocabulary lookups — two to three orders of magnitude more than the single
+// lookup a piece that *is* a token needs. Those pieces are also exactly the ones that repeat: real
+// text reuses the same words over and over, so the same piece is merged again and again, always
+// with the same result (`byte_pair_encode` is a pure function of the piece and the immutable
+// vocabulary). Remembering the result turns every repeat into one hash lookup plus a copy.
+//
+// The cache is sharded by thread the same way the regexes are, so concurrent encoders normally get
+// their own shard and never contend, and each shard is capped so the memory it can hold is bounded.
+
+/// Number of independent cache shards. A thread picks one from its id, as it does for the
+/// thread-local regexes, so concurrent encoders rarely touch the same shard.
+const PIECE_CACHE_SHARDS: usize = MAX_NUM_THREADS;
+
+/// Maximum number of pieces remembered per shard. Once a shard is full it keeps serving what it
+/// already holds but stops growing, which bounds the memory the cache can ever use.
+const PIECE_CACHE_CAPACITY: usize = 1024;
+
+/// Only pieces up to this length are cached. Longer pieces are rare and would make the keys
+/// disproportionately expensive to store and hash.
+const PIECE_CACHE_MAX_PIECE_LEN: usize = 32;
+
+type PieceCache = Vec<Mutex<HashMap<Box<[u8]>, Box<[Rank]>>>>;
+
+fn new_piece_cache() -> Arc<PieceCache> {
+    Arc::new(
+        (0..PIECE_CACHE_SHARDS)
+            .map(|_| Mutex::new(HashMap::default()))
+            .collect(),
+    )
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -332,6 +367,10 @@ pub struct CoreBPE {
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
+    // Sharded, bounded memo of `byte_pair_encode` results for the pieces that are not tokens
+    // themselves. See the notes above `PIECE_CACHE_SHARDS`. Shared between clones of a `CoreBPE`
+    // (they share the same vocabulary, so they would compute the same merges anyway).
+    piece_cache: Arc<PieceCache>,
 }
 
 impl CoreBPE {
@@ -344,6 +383,41 @@ impl CoreBPE {
 
     fn _get_tl_special_regex(&self) -> &Regex {
         &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
+    }
+
+    /// Appends the tokens of `piece` — which is known not to be a token itself — to `out` and
+    /// returns how many were appended.
+    ///
+    /// The merges are looked up in the piece cache first, so a piece that has already been seen
+    /// costs one hash lookup and a copy instead of a full `byte_pair_encode`.
+    fn byte_pair_encode_cached(&self, piece: &[u8], out: &mut Vec<Rank>) -> usize {
+        if piece.len() > PIECE_CACHE_MAX_PIECE_LEN {
+            let tokens = byte_pair_encode(piece, &self.encoder);
+            out.extend_from_slice(&tokens);
+            return tokens.len();
+        }
+
+        let shard = &self.piece_cache[hash_current_thread() % PIECE_CACHE_SHARDS];
+        {
+            // Poisoning cannot make the memo wrong (a poisoned shard just holds correct entries
+            // written before some unrelated panic), so recover from it instead of propagating.
+            let cache = shard.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(tokens) = cache.get(piece) {
+                out.extend_from_slice(tokens);
+                return tokens.len();
+            }
+        }
+
+        // Merge outside the lock, so a shard shared by two threads never makes one wait for the
+        // other's merge.
+        let tokens = byte_pair_encode(piece, &self.encoder);
+        out.extend_from_slice(&tokens);
+
+        let mut cache = shard.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() < PIECE_CACHE_CAPACITY {
+            cache.insert(piece.into(), tokens.as_slice().into());
+        }
+        tokens.len()
     }
 
     /// Resolves a token id to its decoded bytes, checking the regular decoder
@@ -384,7 +458,9 @@ impl CoreBPE {
             let piece = mat.unwrap().as_str().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+                None => {
+                    self.byte_pair_encode_cached(piece, &mut ret);
+                }
             }
         }
         ret
@@ -436,9 +512,7 @@ impl CoreBPE {
                     ret.push(*token);
                     continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
-                last_piece_token_len = tokens.len();
-                ret.extend(&tokens);
+                last_piece_token_len = self.byte_pair_encode_cached(piece, &mut ret);
             }
 
             match next_special {
@@ -704,6 +778,7 @@ impl CoreBPE {
             regex_tls,
             special_regex_tls,
             sorted_token_bytes,
+            piece_cache: new_piece_cache(),
         })
     }
 
