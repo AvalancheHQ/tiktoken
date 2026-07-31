@@ -315,6 +315,196 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+/// The ASCII members of `\s`, in character-class body form.
+const ASCII_WHITESPACE_CLASS_BODY: &str = r"\t\n\x0B\x0C\r ";
+
+/// Rewrites `pattern` into a form that is equivalent **on ASCII-only haystacks**
+/// but whose character classes only span ASCII, or returns `None` when the
+/// pattern uses a construct we cannot narrow with certainty.
+///
+/// The tokeniser split patterns lean on Unicode classes (`\p{L}`, `\p{N}`,
+/// `\s`). Every one of those compiles into a large UTF-8 automaton, which the
+/// regex engine then has to run (as a lazy DFA) for every piece of every
+/// document. Restricted to ASCII input those classes are tiny — `\p{L}` is
+/// `[A-Za-z]`, `\p{N}` is `[0-9]`, `\s` is `[\t\n\x0B\x0C\r ]` — so when the
+/// text is pure ASCII the split can run on a much smaller automaton for
+/// exactly the same result.
+///
+/// The rewrite is deliberately conservative: anything not explicitly
+/// understood (other `\p{..}` classes, negated shorthands, nested classes,
+/// class set operations, Unicode-mode flags) makes the whole thing bail out
+/// and the caller keeps using the original pattern.
+fn ascii_narrowed_pattern(pattern: &str) -> Option<String> {
+    let mut out = String::with_capacity(pattern.len() + 32);
+    let mut chars = pattern.chars().peekable();
+    let mut in_class = false;
+
+    // Emits `body` (a character-class body such as `A-Za-z`), wrapping it in a
+    // class of its own when we are not already inside one.
+    fn push_body(out: &mut String, in_class: bool, body: &str) {
+        if in_class {
+            out.push_str(body);
+        } else {
+            out.push('[');
+            out.push_str(body);
+            out.push(']');
+        }
+    }
+
+    while let Some(c) = chars.next() {
+        if !c.is_ascii() {
+            // A non-ASCII literal can never match an ASCII haystack; rather
+            // than reason about it, keep the original pattern.
+            return None;
+        }
+        match c {
+            '\\' => match chars.next()? {
+                'p' => {
+                    if chars.next()? != '{' {
+                        return None;
+                    }
+                    let mut name = String::new();
+                    loop {
+                        let n = chars.next()?;
+                        if n == '}' {
+                            break;
+                        }
+                        name.push(n);
+                    }
+                    let body = match name.as_str() {
+                        "L" | "Letter" => "A-Za-z",
+                        "N" | "Number" => "0-9",
+                        _ => return None,
+                    };
+                    push_body(&mut out, in_class, body);
+                }
+                's' => push_body(&mut out, in_class, ASCII_WHITESPACE_CLASS_BODY),
+                'd' => push_body(&mut out, in_class, "0-9"),
+                'w' => push_body(&mut out, in_class, "0-9A-Za-z_"),
+                'S' if !in_class => {
+                    out.push_str("[^");
+                    out.push_str(ASCII_WHITESPACE_CLASS_BODY);
+                    out.push(']');
+                }
+                'D' if !in_class => out.push_str("[^0-9]"),
+                'W' if !in_class => out.push_str("[^0-9A-Za-z_]"),
+                // Negated shorthands inside a class, `\P{..}`, and anything
+                // else we have not reasoned about.
+                'S' | 'D' | 'W' | 'P' => return None,
+                escaped => {
+                    if !escaped.is_ascii() {
+                        return None;
+                    }
+                    out.push('\\');
+                    out.push(escaped);
+                }
+            },
+            '[' => {
+                if in_class {
+                    // Nested class (used by the class set operations).
+                    return None;
+                }
+                in_class = true;
+                out.push('[');
+                if chars.peek() == Some(&'^') {
+                    out.push(chars.next()?);
+                }
+                if matches!(chars.peek(), Some(&':')) {
+                    // POSIX class, e.g. `[:alpha:]`.
+                    return None;
+                }
+            }
+            ']' => {
+                in_class = false;
+                out.push(']');
+            }
+            // Class set operations: `&&`, `--`, `~~`.
+            '&' | '~' if in_class => return None,
+            '(' => {
+                out.push('(');
+                if chars.peek() == Some(&'?') {
+                    out.push(chars.next()?);
+                    // Copy the group's flags verbatim, bailing on anything that
+                    // touches Unicode mode.
+                    while let Some(&f) = chars.peek() {
+                        if f == 'u' {
+                            return None;
+                        }
+                        out.push(chars.next()?);
+                        if f == ':' || f == ')' {
+                            break;
+                        }
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+
+    if in_class {
+        return None;
+    }
+    Some(out)
+}
+
+/// Checks that `narrowed` splits ASCII text exactly like `original`.
+///
+/// `ascii_narrowed_pattern` is conservative, but it works on the pattern
+/// source rather than on a parsed regex, so this cross-checks the two engines
+/// on a spread of ASCII inputs (every ASCII character on its own, and every
+/// pair drawn from a set of characters the tokeniser patterns discriminate on)
+/// before the fast path is enabled. If anything differs, the fast path is
+/// simply not used.
+fn ascii_split_is_equivalent(original: &Regex, narrowed: &Regex) -> bool {
+    const INTERESTING: &[u8] = b"aZ09 \t\n\r\x0B\x0C.,'\"-_!?()$~`:;/\\|*+{}[]<>#@^&%=";
+
+    let same_pieces = |text: &str| -> bool {
+        let mut lhs = original.find_iter(text);
+        let mut rhs = narrowed.find_iter(text);
+        loop {
+            match (lhs.next(), rhs.next()) {
+                (None, None) => return true,
+                (Some(Ok(a)), Some(Ok(b))) => {
+                    if a.start() != b.start() || a.end() != b.end() {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    };
+
+    let mut buf = String::with_capacity(3);
+    for a in 0..128u8 {
+        buf.clear();
+        buf.push(a as char);
+        if !same_pieces(&buf) {
+            return false;
+        }
+        for &b in INTERESTING {
+            buf.clear();
+            buf.push(a as char);
+            buf.push(b as char);
+            if !same_pieces(&buf) {
+                return false;
+            }
+        }
+    }
+    for text in [
+        "The quick brown fox jumps over the lazy dog.",
+        "it's a test, isn't it? I'LL do it--- yes!!!",
+        "hello   world\n\n\tfoo bar 12345 6789 0.5 -3e10\r\n  ",
+        "trailing whitespace   ",
+        "a1 b22 c333 d4444",
+        "",
+    ] {
+        if !same_pieces(text) {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -329,17 +519,39 @@ pub struct CoreBPE {
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
+    // Thread-local copies of the split regex. When the pattern could be
+    // narrowed to ASCII (see `ascii_narrowed_pattern`) these hold the narrowed
+    // form, which splits ASCII text exactly like the original but runs on much
+    // smaller automata; `unicode_pattern` then holds the original for text that
+    // is not pure ASCII.
     regex_tls: Vec<Regex>,
+    // The original (Unicode) split pattern, kept only when `regex_tls` holds
+    // the ASCII-narrowed form. Compiled on demand, the first time a text that
+    // is not pure ASCII is encoded, so ASCII-only workloads pay neither the
+    // compilation nor the memory for a second set of regexes.
+    unicode_pattern: Option<String>,
+    unicode_regex_tls: std::sync::OnceLock<Vec<Regex>>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
 
 impl CoreBPE {
-    fn _get_tl_regex(&self) -> &Regex {
-        // See performance notes above for what this is about
-        // It's also a little janky, please make a better version of it!
-        // However, it's nice that this doesn't leak memory to short-lived threads
-        &self.regex_tls[hash_current_thread() % MAX_NUM_THREADS]
+    /// Thread-local split regex to use for `text`.
+    ///
+    /// See the performance notes above for why the regex is thread-local.
+    /// It's also a little janky, please make a better version of it!
+    /// However, it's nice that this doesn't leak memory to short-lived threads.
+    fn _get_tl_regex_for(&self, text: &str) -> &Regex {
+        let slot = hash_current_thread() % MAX_NUM_THREADS;
+        match &self.unicode_pattern {
+            // `regex_tls` is ASCII-narrowed: only equivalent on ASCII text.
+            Some(pattern) if !text.is_ascii() => &self.unicode_regex_tls.get_or_init(|| {
+                (0..MAX_NUM_THREADS)
+                    .map(|_| Regex::new(pattern).expect("pattern compiled at construction"))
+                    .collect()
+            })[slot],
+            _ => &self.regex_tls[slot],
+        }
     }
 
     fn _get_tl_special_regex(&self) -> &Regex {
@@ -378,7 +590,7 @@ impl CoreBPE {
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
-        let regex = self._get_tl_regex();
+        let regex = self._get_tl_regex_for(text);
         let mut ret = vec![];
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
@@ -396,7 +608,7 @@ impl CoreBPE {
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
-        let regex = self._get_tl_regex();
+        let regex = self._get_tl_regex_for(text);
         let mut ret = vec![];
 
         let mut start = 0;
@@ -683,13 +895,34 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
+        // Compiling the pattern here validates it, as before, and gives the
+        // reference the ASCII-narrowed form is checked against.
+        let unicode_regex = Regex::new(pattern)?;
+
+        // The tokeniser split is the hot path of every encode call, and a large
+        // part of it is the automata behind the pattern's Unicode classes. When
+        // the pattern can be restricted to ASCII without changing what it
+        // matches on ASCII text, the thread-local regexes hold that narrowed
+        // form and the original is only compiled if a non-ASCII text shows up.
+        //
+        // The narrowed form is used only if it compiles *and* is verified to
+        // split ASCII text exactly like the original, so an unusual pattern can
+        // never change what the tokeniser produces.
+        let ascii_pattern = ascii_narrowed_pattern(pattern)
+            .filter(|narrowed| narrowed != pattern)
+            .filter(|narrowed| match Regex::new(narrowed) {
+                Ok(narrowed) => ascii_split_is_equivalent(&unicode_regex, &narrowed),
+                Err(_) => false,
+            });
+        let split_pattern = ascii_pattern.as_deref().unwrap_or(pattern);
+
         // Compile an independent regex per thread-local slot instead of cloning one. Cloning a
         // `fancy_regex::Regex` shares an `Arc<Prog>` whose regex-automata engines keep their scratch
         // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
         // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
         // lock-free path), paying the compile cost once at construction rather than on the hot path.
         let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
+            .map(|_| Regex::new(split_pattern))
             .collect::<Result<Vec<_>, _>>()?;
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
@@ -702,6 +935,8 @@ impl CoreBPE {
             special_tokens_decoder,
             decoder_flat,
             regex_tls,
+            unicode_pattern: ascii_pattern.map(|_| pattern.to_string()),
+            unicode_regex_tls: std::sync::OnceLock::new(),
             special_regex_tls,
             sorted_token_bytes,
         })
@@ -743,5 +978,52 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PAT: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K_PAT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// The shipped patterns must narrow, and the narrowed form must split ASCII
+    /// text exactly like the original.
+    #[test]
+    fn test_ascii_narrowed_patterns_are_equivalent() {
+        for pattern in [R50K_PAT, CL100K_PAT] {
+            let narrowed = crate::ascii_narrowed_pattern(pattern)
+                .unwrap_or_else(|| panic!("pattern should narrow: {pattern}"));
+            assert!(!narrowed.contains(r"\p{"));
+            assert!(!narrowed.contains(r"\s"));
+            let original = Regex::new(pattern).unwrap();
+            let narrowed = Regex::new(&narrowed).unwrap();
+            assert!(crate::ascii_split_is_equivalent(&original, &narrowed));
+        }
+    }
+
+    /// Patterns using constructs we do not know how to narrow must bail out,
+    /// keeping the original regex.
+    #[test]
+    fn test_ascii_narrowing_bails_on_unknown_constructs() {
+        for pattern in [
+            O200K_PAT,       // \p{Lu}, \p{M}, ...
+            r"\P{L}+",       // negated Unicode class
+            r"[\S]+",        // negated shorthand inside a class
+            r"[[:alpha:]]",  // POSIX class
+            r"(?u:\p{L})",   // explicit Unicode flag
+            r"[\p{L}&&[a]]", // class set operation
+        ] {
+            assert!(
+                crate::ascii_narrowed_pattern(pattern).is_none(),
+                "pattern should not narrow: {pattern}"
+            );
+        }
+    }
+
+    /// The verification step must reject a rewrite that is not equivalent.
+    #[test]
+    fn test_ascii_split_equivalence_detects_mismatch() {
+        let original = Regex::new(r" ?\p{L}+|\s+|.").unwrap();
+        let wrong = Regex::new(r" ?[A-Za-y]+|[ \t\n\x0B\x0C\r]+|.").unwrap();
+        assert!(!crate::ascii_split_is_equivalent(&original, &wrong));
     }
 }
