@@ -171,9 +171,7 @@ class Encoding:
         [[31373, 995], [11274, 16390, 995]]
         ```
         """
-        encoder = functools.partial(self.encode_ordinary)
-        with ThreadPoolExecutor(num_threads) as e:
-            return list(e.map(encoder, text))
+        return self._core_bpe.encode_ordinary_batch(text, num_threads)
 
     def encode_batch(
         self,

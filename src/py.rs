@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Mutex;
 
 use pyo3::{
     IntoPyObjectExt, PyResult, exceptions,
@@ -29,6 +30,59 @@ impl CoreBPE {
     #[pyo3(name = "encode_ordinary")]
     fn py_encode_ordinary(&self, py: Python, text: &str) -> Vec<Rank> {
         py.detach(|| self.encode_ordinary(text))
+    }
+
+    /// Encodes several texts, ignoring special tokens, spreading the documents
+    /// over `num_threads` worker threads.
+    ///
+    /// The fan-out happens in Rust, so the batch costs one Python call and one
+    /// GIL release instead of one of each per document. The workers stream
+    /// their results back as they finish and this thread — the only one that
+    /// touches Python — turns each one into a `list` of `int`s while the
+    /// workers keep encoding, so building the Python objects (which the GIL
+    /// serialises anyway) overlaps with the encoding instead of trailing it.
+    #[pyo3(name = "encode_ordinary_batch", signature = (texts, num_threads = 8))]
+    fn py_encode_ordinary_batch(
+        &self,
+        py: Python,
+        texts: Vec<PyBackedStr>,
+        num_threads: usize,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let texts: Vec<&str> = texts.iter().map(|text| text.as_ref()).collect();
+        let len = texts.len();
+        let threads = crate::clamp_batch_threads(num_threads, len);
+        if threads <= 1 {
+            return texts
+                .iter()
+                .map(|text| {
+                    let tokens = py.detach(|| self.encode_ordinary(text));
+                    Ok(tokens.into_pyobject(py)?.into_any().unbind())
+                })
+                .collect();
+        }
+
+        let mut ret: Vec<Option<Py<PyAny>>> = (0..len).map(|_| None).collect();
+        std::thread::scope(|scope| -> PyResult<()> {
+            // The workers never touch Python, so the GIL is only needed for the
+            // conversions below and can be released while waiting for them.
+            let rx = Mutex::new(self.spawn_encode_ordinary_workers(scope, &texts, threads));
+            while let Ok((i, tokens)) = py.detach(|| rx.lock().unwrap().recv()) {
+                ret[i] = Some(tokens.into_pyobject(py)?.into_any().unbind());
+            }
+            Ok(())
+        })?;
+
+        // Every index is handed out exactly once, and a panicking worker is
+        // re-raised by `thread::scope` above, so all slots are filled here.
+        ret.into_iter()
+            .map(|tokens| {
+                tokens.ok_or_else(|| {
+                    PyErr::new::<exceptions::PyRuntimeError, _>(
+                        "batch encoding did not produce a result for every document",
+                    )
+                })
+            })
+            .collect()
     }
 
     #[pyo3(name = "encode")]
