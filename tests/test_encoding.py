@@ -253,6 +253,22 @@ def test_batch_encode(make_enc: Callable[[], tiktoken.Encoding]):
 
 
 @pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
+@pytest.mark.parametrize("num_threads", [1, 4])
+def test_batch_encode_ordinary_many_documents(
+    make_enc: Callable[[], tiktoken.Encoding], num_threads: int
+):
+    # More documents than threads, of uneven length, so the documents are handed
+    # out over several rounds: the results must still come back in input order.
+    enc = make_enc()
+    documents = [f"hello world {i} " * (i % 5 + 1) for i in range(32)]
+
+    assert enc.encode_ordinary_batch(documents, num_threads=num_threads) == [
+        enc.encode_ordinary(document) for document in documents
+    ]
+    assert enc.encode_ordinary_batch([], num_threads=num_threads) == []
+
+
+@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
 @hypothesis.given(batch=st.lists(st.text()))
 @hypothesis.settings(deadline=None, max_examples=MAX_EXAMPLES)
 def test_hyp_batch_roundtrip(make_enc: Callable[[], tiktoken.Encoding], batch):
