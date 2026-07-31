@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use fancy_regex::Regex;
@@ -385,6 +386,58 @@ impl CoreBPE {
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+            }
+        }
+        ret
+    }
+
+    /// Encodes several texts, ignoring special tokens, spreading the documents
+    /// over `num_threads` worker threads.
+    ///
+    /// Batching inside the core keeps the whole fan-out in Rust: the caller
+    /// pays for one batch call instead of one call per document, and none of
+    /// the per-document scheduling machinery a Python thread pool needs (a
+    /// pool, a queue entry and a future per document, plus a GIL round trip
+    /// per call). Documents are handed out dynamically so uneven input sizes
+    /// still balance across the workers.
+    pub fn encode_ordinary_batch(&self, texts: &[&str], num_threads: usize) -> Vec<Vec<Rank>> {
+        let len = texts.len();
+        let threads = num_threads.clamp(1, MAX_NUM_THREADS).min(len);
+        if threads <= 1 {
+            return texts
+                .iter()
+                .map(|text| self.encode_ordinary(text))
+                .collect();
+        }
+
+        let next = AtomicUsize::new(0);
+        let encoded_per_thread: Vec<Vec<(usize, Vec<Rank>)>> = thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let next = &next;
+                    scope.spawn(move || {
+                        let mut encoded = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= len {
+                                break;
+                            }
+                            encoded.push((i, self.encode_ordinary(texts[i])));
+                        }
+                        encoded
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_default())
+                .collect()
+        });
+
+        let mut ret = vec![Vec::new(); len];
+        for encoded in encoded_per_thread {
+            for (i, tokens) in encoded {
+                ret[i] = tokens;
             }
         }
         ret

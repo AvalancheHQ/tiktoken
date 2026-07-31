@@ -31,6 +31,19 @@ impl CoreBPE {
         py.detach(|| self.encode_ordinary(text))
     }
 
+    #[pyo3(name = "encode_ordinary_batch", signature = (texts, num_threads = 8))]
+    fn py_encode_ordinary_batch(
+        &self,
+        py: Python,
+        texts: Vec<PyBackedStr>,
+        num_threads: usize,
+    ) -> Vec<Vec<Rank>> {
+        py.detach(|| {
+            let texts: Vec<&str> = texts.iter().map(|text| text.as_ref()).collect();
+            self.encode_ordinary_batch(&texts, num_threads)
+        })
+    }
+
     #[pyo3(name = "encode")]
     fn py_encode(
         &self,
