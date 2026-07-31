@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 
 use fancy_regex::Regex;
@@ -316,6 +318,13 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+/// Number of worker threads to actually use for a batch of `len` documents:
+/// never more than the thread-local regex slots we have, and never more than
+/// there is work for.
+pub(crate) fn clamp_batch_threads(num_threads: usize, len: usize) -> usize {
+    num_threads.clamp(1, MAX_NUM_THREADS).min(len)
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -391,6 +400,43 @@ impl CoreBPE {
         ret
     }
 
+    /// Spawns `threads` scoped workers that encode `texts` (ignoring special
+    /// tokens) and stream each `(index, tokens)` pair back through the returned
+    /// receiver as soon as it is ready.
+    ///
+    /// Documents are handed out dynamically through a shared counter, so uneven
+    /// input sizes still balance across the workers. Streaming the results back
+    /// instead of collecting them lets the caller do something with each
+    /// document (for the Python binding: turn it into a `list` of `int`s, which
+    /// has to happen on a single thread) while the workers keep encoding.
+    fn spawn_encode_ordinary_workers<'scope, 'env>(
+        &'env self,
+        scope: &'scope thread::Scope<'scope, 'env>,
+        texts: &'env [&'env str],
+        threads: usize,
+    ) -> mpsc::Receiver<(usize, Vec<Rank>)> {
+        let len = texts.len();
+        let next = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..threads {
+            let next = Arc::clone(&next);
+            let tx = tx.clone();
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= len {
+                        break;
+                    }
+                    // The receiver is gone (the caller bailed out): stop early.
+                    if tx.send((i, self.encode_ordinary(texts[i]))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        rx
+    }
+
     /// Encodes several texts, ignoring special tokens, spreading the documents
     /// over `num_threads` worker threads.
     ///
@@ -398,11 +444,10 @@ impl CoreBPE {
     /// pays for one batch call instead of one call per document, and none of
     /// the per-document scheduling machinery a Python thread pool needs (a
     /// pool, a queue entry and a future per document, plus a GIL round trip
-    /// per call). Documents are handed out dynamically so uneven input sizes
-    /// still balance across the workers.
+    /// per call).
     pub fn encode_ordinary_batch(&self, texts: &[&str], num_threads: usize) -> Vec<Vec<Rank>> {
         let len = texts.len();
-        let threads = num_threads.clamp(1, MAX_NUM_THREADS).min(len);
+        let threads = clamp_batch_threads(num_threads, len);
         if threads <= 1 {
             return texts
                 .iter()
@@ -410,36 +455,12 @@ impl CoreBPE {
                 .collect();
         }
 
-        let next = AtomicUsize::new(0);
-        let encoded_per_thread: Vec<Vec<(usize, Vec<Rank>)>> = thread::scope(|scope| {
-            let handles: Vec<_> = (0..threads)
-                .map(|_| {
-                    let next = &next;
-                    scope.spawn(move || {
-                        let mut encoded = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            if i >= len {
-                                break;
-                            }
-                            encoded.push((i, self.encode_ordinary(texts[i])));
-                        }
-                        encoded
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap_or_default())
-                .collect()
-        });
-
         let mut ret = vec![Vec::new(); len];
-        for encoded in encoded_per_thread {
-            for (i, tokens) in encoded {
+        thread::scope(|scope| {
+            for (i, tokens) in self.spawn_encode_ordinary_workers(scope, texts, threads) {
                 ret[i] = tokens;
             }
-        }
+        });
         ret
     }
 
