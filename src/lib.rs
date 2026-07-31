@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::thread;
 
-use fancy_regex::Regex;
+use fancy_regex::{Expr, Match, Regex};
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
@@ -315,6 +315,181 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+// Splitting the text with the tokeniser pattern dominates every encode call, so
+// how `fancy_regex` compiles that pattern matters a lot.
+//
+// The tokeniser patterns are "fancy" (possessive quantifiers, `(?!\S)`), so they
+// run on the backtracking VM. When the pattern is a bare alternation, the
+// compiler delegates *every* branch to its own `regex-automata` search, and the
+// VM pays that call overhead once per branch it tries — for every single piece,
+// even though a piece is only a handful of bytes.
+//
+// Prefixing the pattern with `\G` makes the root a concatenation, which the
+// compiler treats as "hard" and compiles the branch structure into plain VM
+// instructions instead. The heavy scans (`\p{L}++` and friends) sit in atomic
+// groups, which stay delegated, so we only trade cheap per-branch automaton
+// calls for cheap VM instructions. `\G` also pins the match to the position we
+// ask for, which is where the next piece always starts.
+//
+// That trade is only a win when the expensive repeats *are* atomic. A pattern
+// like `o200k_base`'s, whose letter runs are plain greedy repeats, would end up
+// running one automaton call per character, so `is_anchorable_split_pattern`
+// keeps such patterns (and any pattern the `regex` crate can handle by itself)
+// on the original path.
+fn anchored_split_pattern(pattern: &str) -> Option<String> {
+    if !is_anchorable_split_pattern(pattern) {
+        return None;
+    }
+    Some(format!(r"\G(?:{pattern})"))
+}
+
+fn is_anchorable_split_pattern(pattern: &str) -> bool {
+    // Patterns the `regex` crate accepts are delegated by `fancy_regex` in one
+    // piece and never reach the VM. Anchoring those would force them onto it.
+    if regex::Regex::new(pattern).is_ok() {
+        return false;
+    }
+    match Expr::parse_tree(pattern) {
+        Ok(tree) => is_cheap_to_inline(&tree.expr),
+        Err(_) => false,
+    }
+}
+
+/// Whether compiling `expr` as VM instructions (rather than delegating it to an
+/// automaton) keeps the per-character cost bounded.
+fn is_cheap_to_inline(expr: &Expr) -> bool {
+    match expr {
+        // Atomic groups — which is what possessive quantifiers parse into — are
+        // delegated to an automaton even inside a "hard" region, so whatever
+        // they contain keeps running on the automaton.
+        Expr::AtomicGroup(_) => true,
+        Expr::Repeat { child, hi, .. } => {
+            // An unbounded repeat becomes a VM loop with one delegate call per
+            // iteration. That is fine for the short runs of whitespace or
+            // punctuation a tokeniser pattern matches, but not for the letter
+            // and digit runs that make up most of real text.
+            if *hi == usize::MAX && can_match_word_char(child) {
+                return false;
+            }
+            is_cheap_to_inline(child)
+        }
+        Expr::Concat(children) | Expr::Alt(children) => children.iter().all(is_cheap_to_inline),
+        Expr::Group(child) | Expr::LookAround(child, _) => is_cheap_to_inline(child),
+        Expr::Conditional { .. } | Expr::SubroutineCall(_) => false,
+        _ => true,
+    }
+}
+
+/// Whether `expr` can consume a letter or a digit. Errs on the side of `true`,
+/// which only ever means we leave the pattern on the original path.
+fn can_match_word_char(expr: &Expr) -> bool {
+    const SAMPLES: [&str; 5] = ["a", "Z", "5", "é", "字"];
+    match expr {
+        Expr::Empty | Expr::Assertion(_) | Expr::KeepOut | Expr::ContinueFromPreviousMatchEnd => {
+            false
+        }
+        Expr::Literal { val, .. } => val.chars().any(char::is_alphanumeric),
+        // Character classes and other atoms are kept as regex-crate source.
+        Expr::Delegate { inner, casei, .. } => {
+            let inner = if *casei {
+                format!("(?i:{inner})")
+            } else {
+                inner.clone()
+            };
+            match regex::Regex::new(&inner) {
+                Ok(re) => SAMPLES.iter().any(|s| re.is_match(s)),
+                Err(_) => true,
+            }
+        }
+        Expr::Concat(children) | Expr::Alt(children) => children.iter().any(can_match_word_char),
+        Expr::Group(child) | Expr::AtomicGroup(child) | Expr::Repeat { child, .. } => {
+            can_match_word_char(child)
+        }
+        _ => true,
+    }
+}
+
+fn next_char_boundary(text: &str, ix: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = ix + 1;
+    while i < bytes.len() && (bytes[i] & 0b1100_0000) == 0b1000_0000 {
+        i += 1;
+    }
+    i
+}
+
+/// Iterator over the split pieces of `text`, equivalent to
+/// `fancy_regex::Regex::find_iter`.
+///
+/// `primary` is matched at the current position with `find_from_pos`. When it is
+/// the `\G` anchored form of the pattern it only ever matches there, so
+/// `unanchored` (the pattern as written) is consulted for the positions where a
+/// plain `find_iter` would have skipped ahead to the next match. For tokeniser
+/// patterns, which match at every position, that never happens.
+struct Pieces<'r, 't> {
+    primary: &'r Regex,
+    unanchored: Option<&'r Regex>,
+    text: &'t str,
+    last_end: usize,
+    last_match: Option<usize>,
+}
+
+impl<'r, 't> Pieces<'r, 't> {
+    fn new(primary: &'r Regex, unanchored: Option<&'r Regex>, text: &'t str) -> Self {
+        Pieces {
+            primary,
+            unanchored,
+            text,
+            last_end: 0,
+            last_match: None,
+        }
+    }
+}
+
+impl<'t> Iterator for Pieces<'_, 't> {
+    type Item = fancy_regex::Result<Match<'t>>;
+
+    // Adapted from `fancy_regex::Matches`, including its handling of empty
+    // matches, so the piece stream is identical.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.last_end > self.text.len() {
+            return None;
+        }
+        let mut found = match self.primary.find_from_pos(self.text, self.last_end) {
+            Ok(found) => found,
+            Err(error) => {
+                self.last_end = self.text.len() + 1;
+                return Some(Err(error));
+            }
+        };
+        if found.is_none()
+            && let Some(unanchored) = self.unanchored
+        {
+            found = match unanchored.find_from_pos(self.text, self.last_end) {
+                Ok(found) => found,
+                Err(error) => {
+                    self.last_end = self.text.len() + 1;
+                    return Some(Err(error));
+                }
+            };
+        }
+        let mat = found?;
+
+        if mat.start() == mat.end() {
+            // Empty match: make progress, and don't accept an empty match
+            // directly after a previous match.
+            self.last_end = next_char_boundary(self.text, mat.end());
+            if Some(mat.end()) == self.last_match {
+                return self.next();
+            }
+        } else {
+            self.last_end = mat.end();
+        }
+        self.last_match = Some(mat.end());
+        Some(Ok(mat))
+    }
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -329,7 +504,14 @@ pub struct CoreBPE {
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
+    // The split regex, one independent copy per thread-local slot. It is the
+    // `\G` anchored form of the pattern when that is eligible (see
+    // `anchored_split_pattern`), otherwise the pattern as written.
     regex_tls: Vec<Regex>,
+    // The pattern as written, kept only when `regex_tls` holds the anchored
+    // form: it is what finds the next match when nothing matches at the current
+    // position, which is what a plain `find_iter` would do.
+    unanchored_regex: Option<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
@@ -344,6 +526,11 @@ impl CoreBPE {
 
     fn _get_tl_special_regex(&self) -> &Regex {
         &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
+    }
+
+    /// Splits `text` into the pieces the tokeniser pattern matches.
+    fn _split_pieces<'a, 't>(&'a self, regex: &'a Regex, text: &'t str) -> Pieces<'a, 't> {
+        Pieces::new(regex, self.unanchored_regex.as_ref(), text)
     }
 
     /// Resolves a token id to its decoded bytes, checking the regular decoder
@@ -380,7 +567,7 @@ impl CoreBPE {
         // just make things complicated :-)
         let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
+        for mat in self._split_pieces(regex, text) {
             let piece = mat.unwrap().as_str().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
@@ -420,7 +607,7 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
+            for mat_res in self._split_pieces(regex, &text[start..end]) {
                 let mat = match mat_res {
                     Ok(m) => m,
                     Err(e) => {
@@ -688,9 +875,31 @@ impl CoreBPE {
         // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
         // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
         // lock-free path), paying the compile cost once at construction rather than on the hot path.
-        let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
-            .collect::<Result<Vec<_>, _>>()?;
+        //
+        // Where possible the slots hold the `\G` anchored form of the pattern,
+        // which the split iterator matches at the position the previous piece
+        // ended; see `anchored_split_pattern` for why that is faster.
+        let anchored = anchored_split_pattern(pattern).and_then(|anchored_pattern| {
+            Regex::new(&anchored_pattern)
+                .ok()
+                .map(|regex| (anchored_pattern, regex))
+        });
+        let (regex_tls, unanchored_regex) = match anchored {
+            Some((anchored_pattern, first)) => {
+                let mut regex_tls = Vec::with_capacity(MAX_NUM_THREADS);
+                regex_tls.push(first);
+                for _ in 1..MAX_NUM_THREADS {
+                    regex_tls.push(Regex::new(&anchored_pattern)?);
+                }
+                (regex_tls, Some(Regex::new(pattern)?))
+            }
+            None => (
+                (0..MAX_NUM_THREADS)
+                    .map(|_| Regex::new(pattern))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None,
+            ),
+        };
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
             .collect::<Result<Vec<_>, _>>()?;
@@ -702,6 +911,7 @@ impl CoreBPE {
             special_tokens_decoder,
             decoder_flat,
             regex_tls,
+            unanchored_regex,
             special_regex_tls,
             sorted_token_bytes,
         })
@@ -743,5 +953,87 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PAT: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K_PAT: &str = concat!(
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+        r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+        r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+    );
+
+    #[test]
+    fn test_anchorable_split_patterns() {
+        // The shipped patterns whose heavy repeats are possessive benefit.
+        assert!(crate::is_anchorable_split_pattern(R50K_PAT));
+        assert!(crate::is_anchorable_split_pattern(CL100K_PAT));
+        // `o200k_base` repeats letter classes greedily: inlining those would
+        // cost one automaton call per character.
+        assert!(!crate::is_anchorable_split_pattern(O200K_PAT));
+        // Patterns the `regex` crate handles never reach the VM to begin with.
+        assert!(!crate::is_anchorable_split_pattern(r"\w+|\s+"));
+        assert!(!crate::is_anchorable_split_pattern(r"[^\s\p{L}\p{N}]+"));
+    }
+
+    #[test]
+    fn test_pieces_match_find_iter() {
+        let texts = [
+            "",
+            " ",
+            "hello world",
+            "The quick brown fox jumps over the lazy dog. 12345 6789!!",
+            "  leading and trailing   ",
+            "tabs\tand\nnewlines\r\n\r\n  more\n",
+            "don't  can't I'LL  we've 'tis '''",
+            "Ünïcödé — 漢字 テスト, emoji 🎉🎉 and ﬀ ligatures",
+            "1 12 123 1234 12345",
+            "trailing whitespace   ",
+            "\n\n\n",
+            "a\u{a0}b\u{2003}c",
+        ];
+        for pattern in [R50K_PAT, CL100K_PAT, O200K_PAT, r"\w+|\s+"] {
+            let plain = Regex::new(pattern).unwrap();
+            let primary = match crate::anchored_split_pattern(pattern) {
+                Some(anchored) => Regex::new(&anchored).unwrap(),
+                None => Regex::new(pattern).unwrap(),
+            };
+            let unanchored = crate::anchored_split_pattern(pattern).map(|_| plain.clone());
+            for text in texts {
+                let expected: Vec<&str> =
+                    plain.find_iter(text).map(|m| m.unwrap().as_str()).collect();
+                let actual: Vec<&str> = crate::Pieces::new(&primary, unanchored.as_ref(), text)
+                    .map(|m| m.unwrap().as_str())
+                    .collect();
+                assert_eq!(expected, actual, "pattern {pattern:?} text {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pieces_with_gaps_and_empty_matches() {
+        // Patterns that do not match at every position, and that can match
+        // empty, exercise the fallback and the empty-match handling.
+        for pattern in [r"\d+(?!x)", r"(?:a|)(?!q)", r"[abc]*+(?!z)"] {
+            let plain = Regex::new(pattern).unwrap();
+            let primary = Regex::new(&format!(r"\G(?:{pattern})")).unwrap();
+            for text in ["", "abc 123 xyz 45x 6", "aaa bbb", "qqq", "zzabcz"] {
+                let expected: Vec<(usize, usize)> = plain
+                    .find_iter(text)
+                    .map(|m| {
+                        let m = m.unwrap();
+                        (m.start(), m.end())
+                    })
+                    .collect();
+                let actual: Vec<(usize, usize)> = crate::Pieces::new(&primary, Some(&plain), text)
+                    .map(|m| {
+                        let m = m.unwrap();
+                        (m.start(), m.end())
+                    })
+                    .collect();
+                assert_eq!(expected, actual, "pattern {pattern:?} text {text:?}");
+            }
+        }
     }
 }
