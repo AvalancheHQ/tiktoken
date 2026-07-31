@@ -315,6 +315,70 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+/// Number of token bytes stored directly inside a [`TokenEntry`].
+///
+/// 16-byte entries keep the rank-indexed decode table small (four entries per
+/// cache line) while still holding ~99% of the tokens of the encodings tiktoken
+/// ships (`gpt2`: 99.7% ≤ 15 bytes, `cl100k_base`: 99.0%).
+const INLINE_TOKEN_LEN: usize = 15;
+
+/// `len` marker for a token whose bytes did not fit inline; the first four
+/// bytes of `data` then hold its index into `CoreBPE::decoder_long`.
+const OUT_OF_LINE: u8 = u8::MAX;
+
+/// Width of the fixed-size copy the decode loop performs for an inline token.
+///
+/// It is the whole size of a [`TokenEntry`], so the source of the copy is
+/// always fully in bounds of the entry itself.
+const TOKEN_COPY_WIDTH: usize = 16;
+
+/// One slot of the rank-indexed decode table.
+///
+/// Short tokens (the overwhelming majority) carry their bytes inline, so
+/// resolving a token id is a single memory access instead of a table load
+/// followed by chasing that entry's heap pointer, and emitting the token means
+/// copying a constant 16 bytes rather than calling `memcpy` with a
+/// runtime-variable length.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TokenEntry {
+    data: [u8; INLINE_TOKEN_LEN],
+    /// `0` = no token with this rank, `1..=INLINE_TOKEN_LEN` = inline length,
+    /// [`OUT_OF_LINE`] = the bytes live in `decoder_long`.
+    len: u8,
+}
+
+const _: [u8; TOKEN_COPY_WIDTH] = [0; std::mem::size_of::<TokenEntry>()];
+
+impl TokenEntry {
+    const EMPTY: Self = Self {
+        data: [0; INLINE_TOKEN_LEN],
+        len: 0,
+    };
+
+    #[inline]
+    fn inline(bytes: &[u8]) -> Self {
+        debug_assert!(!bytes.is_empty() && bytes.len() <= INLINE_TOKEN_LEN);
+        let mut entry = Self::EMPTY;
+        entry.len = bytes.len() as u8;
+        entry.data[..bytes.len()].copy_from_slice(bytes);
+        entry
+    }
+
+    #[inline]
+    fn out_of_line(index: u32) -> Self {
+        let mut entry = Self::EMPTY;
+        entry.len = OUT_OF_LINE;
+        entry.data[..4].copy_from_slice(&index.to_ne_bytes());
+        entry
+    }
+
+    #[inline]
+    fn long_index(&self) -> usize {
+        u32::from_ne_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) as usize
+    }
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -328,7 +392,13 @@ pub struct CoreBPE {
     // then falling back to `special_tokens_decoder`. `decode` is the hottest
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
-    decoder_flat: Vec<Vec<u8>>,
+    //
+    // Entries are fixed-size and store short tokens inline, so the common
+    // lookup touches exactly one cache line and never follows a pointer into a
+    // separately allocated token buffer.
+    decoder_flat: Vec<TokenEntry>,
+    // Bytes of the rare tokens that do not fit inline in a `TokenEntry`.
+    decoder_long: Vec<Vec<u8>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
@@ -352,15 +422,82 @@ impl CoreBPE {
     /// This is the single source of truth for the token lookup order used by
     /// every decode path (both the pure-Rust `decode_bytes` and the fused
     /// Python `list` fast path in `py.rs`), so they cannot diverge.
+    #[inline]
     pub(crate) fn token_bytes(&self, token: Rank) -> Option<&[u8]> {
-        // Ranks are dense, so `decoder_flat` covers every valid token with a
-        // direct index. Empty entries mark ranks with no token (there should be
-        // none for well-formed vocabularies, but we stay defensive), which we
-        // treat as a miss.
+        let entry = self.token_entry(token)?;
+        Some(self.entry_bytes(entry))
+    }
+
+    /// Resolves a token id to its decode-table entry, or `None` if the id does
+    /// not name a token.
+    ///
+    /// Ranks are dense, so `decoder_flat` covers every valid token with a
+    /// direct index. A zero length marks a rank with no token (there should be
+    /// none for well-formed vocabularies, but we stay defensive).
+    #[inline]
+    pub(crate) fn token_entry(&self, token: Rank) -> Option<&TokenEntry> {
         match self.decoder_flat.get(token as usize) {
-            Some(bytes) if !bytes.is_empty() => Some(bytes.as_slice()),
+            Some(entry) if entry.len != 0 => Some(entry),
             _ => None,
         }
+    }
+
+    #[inline]
+    fn entry_bytes<'a>(&'a self, entry: &'a TokenEntry) -> &'a [u8] {
+        if entry.len == OUT_OF_LINE {
+            self.decoder_long[entry.long_index()].as_slice()
+        } else {
+            &entry.data[..entry.len as usize]
+        }
+    }
+
+    /// Number of bytes a resolved entry decodes to.
+    #[inline]
+    pub(crate) fn entry_len(&self, entry: &TokenEntry) -> usize {
+        if entry.len == OUT_OF_LINE {
+            self.decoder_long[entry.long_index()].len()
+        } else {
+            entry.len as usize
+        }
+    }
+
+    /// Writes the bytes of already resolved `entries` into `dst`, whose length
+    /// must be exactly the sum of their [`CoreBPE::entry_len`]s.
+    ///
+    /// Inline tokens are emitted with a single constant-width 16-byte copy —
+    /// the whole entry — instead of a variable-length `memcpy` call. Any bytes
+    /// written past the token's own length are always overwritten by the
+    /// following token (or, for the last tokens of the buffer, avoided by
+    /// falling back to an exact copy), so the result is unchanged.
+    pub(crate) fn write_token_bytes(&self, entries: &[&TokenEntry], dst: &mut [u8]) {
+        let total = dst.len();
+        let mut pos = 0usize;
+        for entry in entries {
+            let len = entry.len as usize;
+            if len == OUT_OF_LINE as usize {
+                let bytes = self.decoder_long[entry.long_index()].as_slice();
+                dst[pos..pos + bytes.len()].copy_from_slice(bytes);
+                pos += bytes.len();
+                continue;
+            }
+            if pos + TOKEN_COPY_WIDTH <= total {
+                // SAFETY: the source is the entry itself, which is exactly
+                // `TOKEN_COPY_WIDTH` bytes, and the destination has at least
+                // that many bytes left (checked above). The two never overlap:
+                // `dst` is a freshly allocated output buffer.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        *entry as *const TokenEntry as *const u8,
+                        dst.as_mut_ptr().add(pos),
+                        TOKEN_COPY_WIDTH,
+                    );
+                }
+            } else {
+                dst[pos..pos + len].copy_from_slice(&entry.data[..len]);
+            }
+            pos += len;
+        }
+        debug_assert_eq!(pos, total);
     }
 
     /// Decodes tokens into a list of bytes.
@@ -661,18 +798,29 @@ impl CoreBPE {
 
         // Build a flat, rank-indexed decode table. Token ranks are dense, so
         // this lets the decode hot path resolve a token with a single indexed
-        // slice lookup instead of two hash lookups. Empty slots correspond to
-        // ranks with no token (none for well-formed vocabularies).
+        // lookup instead of two hash lookups. Short tokens (~99% of a real
+        // vocabulary) keep their bytes inside the table entry, so the lookup
+        // does not chase a pointer into a separately allocated buffer; longer
+        // ones spill into `decoder_long`. Zero-length slots correspond to ranks
+        // with no token (none for well-formed vocabularies).
         let max_rank = decoder
             .keys()
             .chain(special_tokens_decoder.keys())
             .copied()
             .max();
-        let decoder_flat: Vec<Vec<u8>> = match max_rank {
+        let mut decoder_long: Vec<Vec<u8>> = Vec::new();
+        let decoder_flat: Vec<TokenEntry> = match max_rank {
             Some(max_rank) => {
-                let mut flat = vec![Vec::new(); max_rank as usize + 1];
+                let mut flat = vec![TokenEntry::EMPTY; max_rank as usize + 1];
                 for (&rank, bytes) in decoder.iter().chain(special_tokens_decoder.iter()) {
-                    flat[rank as usize] = bytes.clone();
+                    flat[rank as usize] = if bytes.is_empty() {
+                        TokenEntry::EMPTY
+                    } else if bytes.len() <= INLINE_TOKEN_LEN {
+                        TokenEntry::inline(bytes)
+                    } else {
+                        decoder_long.push(bytes.clone());
+                        TokenEntry::out_of_line((decoder_long.len() - 1) as u32)
+                    };
                 }
                 flat
             }
@@ -701,6 +849,7 @@ impl CoreBPE {
             decoder,
             special_tokens_decoder,
             decoder_flat,
+            decoder_long,
             regex_tls,
             special_regex_tls,
             sorted_token_bytes,
@@ -725,7 +874,7 @@ mod tests {
     use fancy_regex::Regex;
     use rustc_hash::FxHashMap as HashMap;
 
-    use crate::{Rank, byte_pair_split};
+    use crate::{CoreBPE, Rank, TokenEntry, byte_pair_split};
 
     fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
         HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
@@ -743,5 +892,56 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    #[test]
+    fn test_decode_inline_and_out_of_line_tokens() {
+        // A vocabulary mixing tokens that fit inline in a decode-table entry
+        // with one that does not, so both decode paths are covered.
+        let long = vec![b'x'; 40];
+        let encoder: Vec<(Vec<u8>, Rank)> = vec![
+            (b"a".to_vec(), 0),
+            (b"bcd".to_vec(), 1),
+            (b"fifteen bytes!!".to_vec(), 2),
+            (long.clone(), 3),
+        ];
+        let bpe = CoreBPE::new::<_, _, Vec<(String, (Rank, Rank))>>(
+            encoder,
+            vec![("<|end|>".to_string(), 4)],
+            ".",
+        )
+        .unwrap();
+
+        assert_eq!(bpe.token_bytes(0), Some(b"a".as_slice()));
+        assert_eq!(bpe.token_bytes(2), Some(b"fifteen bytes!!".as_slice()));
+        assert_eq!(bpe.token_bytes(3), Some(long.as_slice()));
+        assert_eq!(bpe.token_bytes(4), Some(b"<|end|>".as_slice()));
+        assert_eq!(bpe.token_bytes(5), None);
+
+        // Every ordering matters: the wide inline copy writes past a token's
+        // own length, so following tokens (including the last one, and the
+        // out-of-line token) must still land byte-exact.
+        let cases: [&[Rank]; 5] = [
+            &[0],
+            &[0, 1, 2, 3, 4],
+            &[3, 2, 1, 0],
+            &[2, 2, 2, 0],
+            &[1, 3, 1, 4, 0, 2],
+        ];
+        for tokens in cases {
+            let expected: Vec<u8> = tokens
+                .iter()
+                .flat_map(|&t| bpe.token_bytes(t).unwrap().to_vec())
+                .collect();
+            assert_eq!(bpe.decode_bytes(tokens).unwrap(), expected);
+
+            let entries: Vec<&TokenEntry> = tokens
+                .iter()
+                .map(|&t| bpe.token_entry(t).unwrap())
+                .collect();
+            let mut buf = vec![0u8; expected.len()];
+            bpe.write_token_bytes(&entries, &mut buf);
+            assert_eq!(buf, expected);
+        }
     }
 }
