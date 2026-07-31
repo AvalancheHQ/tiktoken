@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pyo3::{
     IntoPyObjectExt, PyResult, exceptions,
@@ -168,10 +169,25 @@ impl CoreBPE {
         // overlap here.
         if let Ok(list) = tokens.downcast::<PyList>() {
             // Resolve every token to its byte slice and accumulate total length.
+            //
+            // `compact_ints` is hoisted out of the loop: it is a one-off check
+            // that the interpreter lays its `int` objects out the way
+            // `read_compact_rank` expects, so the per-token path is a plain
+            // predictable branch.
+            let compact_ints = COMPACT_INT_LAYOUT_OK.load(Ordering::Relaxed);
             let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
             let mut total_len = 0usize;
             for item in list.iter() {
-                let token = read_rank(&item)?;
+                // SAFETY: `item` is a valid, non-null borrowed Python object and
+                // we hold the GIL. The layout the reader relies on was verified
+                // against this interpreter at import time.
+                let token = match compact_ints
+                    .then(|| unsafe { read_compact_rank(item.as_ptr()) })
+                    .flatten()
+                {
+                    Some(rank) => rank,
+                    None => read_rank(&item)?,
+                };
                 let token_bytes = self.token_bytes(token).ok_or_else(|| {
                     pyo3::exceptions::PyKeyError::new_err(format!(
                         "Invalid token for decoding: {token}"
@@ -219,6 +235,105 @@ impl CoreBPE {
             .map(|x| PyBytes::new(py, x).into())
             .collect()
     }
+}
+
+/// Whether this interpreter stores its `int` objects the way
+/// [`read_compact_rank`] reads them. Verified once at import time; until then
+/// (and forever, on an interpreter whose layout we do not recognise) the decode
+/// path uses the C-API reader only.
+static COMPACT_INT_LAYOUT_OK: AtomicBool = AtomicBool::new(false);
+
+/// Prefix of CPython 3.12+'s `PyLongObject`: the object header, then the
+/// `_PyLongValue` tag and the first digit.
+///
+/// Only the prefix is declared, which is all the reader touches. `ob_base` is
+/// pyo3's `PyObject`, so the header matches whatever build (free-threaded,
+/// trace-refs, ...) the extension is compiled for.
+#[repr(C)]
+struct CompactPyLong {
+    ob_base: pyo3::ffi::PyObject,
+    lv_tag: usize,
+    digit0: u32,
+}
+
+/// `lv_tag` packs the digit count in the bits above the 3 low sign bits, with
+/// `SIGN_ZERO == 1` and `SIGN_NEGATIVE == 2`. So a zero is tagged `1` and a
+/// single-digit non-negative `int` is tagged `1 << 3`. Every other tag (more
+/// digits, or a negative sign) routes to the C-API reader.
+const LONG_TAG_ZERO: usize = 1;
+const LONG_TAG_ONE_DIGIT: usize = 8;
+
+/// Read a non-negative single-digit `int` straight out of the object, without
+/// calling into libpython.
+///
+/// Returns `None` for anything that is not an exact, non-negative, single-digit
+/// `int`; the caller then falls back to [`read_rank`], so behaviour (including
+/// error types) is unchanged.
+///
+/// # Safety
+///
+/// `item` must be a valid, non-null Python object and the GIL must be held.
+#[inline]
+unsafe fn read_compact_rank(item: *mut pyo3::ffi::PyObject) -> Option<Rank> {
+    unsafe {
+        if pyo3::ffi::PyLong_CheckExact(item) == 0 {
+            return None;
+        }
+        let long = item.cast::<CompactPyLong>();
+        match (*long).lv_tag {
+            LONG_TAG_ZERO => Some(0),
+            LONG_TAG_ONE_DIGIT => Some((*long).digit0),
+            _ => None,
+        }
+    }
+}
+
+/// Check [`read_compact_rank`] against the running interpreter before the
+/// decode path is allowed to use it.
+///
+/// Every value that must be read inline is round-tripped through a real
+/// `int` object, and values that must be refused (negative, multi-digit) are
+/// checked to be refused. An interpreter with a different `int` layout — an
+/// older CPython, a 15-bit-digit build, PyPy — fails this and keeps using the
+/// C-API reader.
+fn compact_int_layout_is_valid() -> bool {
+    for value in [
+        0u32,
+        1,
+        2,
+        255,
+        256,
+        65_535,
+        100_000,
+        200_000,
+        (1 << 30) - 1,
+    ] {
+        // SAFETY: we hold the GIL (called from module initialisation).
+        let obj = unsafe { pyo3::ffi::PyLong_FromUnsignedLong(value.into()) };
+        if obj.is_null() {
+            unsafe { pyo3::ffi::PyErr_Clear() };
+            return false;
+        }
+        let read = unsafe { read_compact_rank(obj) };
+        unsafe { pyo3::ffi::Py_DECREF(obj) };
+        if read != Some(value) {
+            return false;
+        }
+    }
+    for value in [-1i64, -(1 << 40), 1 << 40] {
+        // SAFETY: we hold the GIL (called from module initialisation).
+        let obj = unsafe { pyo3::ffi::PyLong_FromLongLong(value) };
+        if obj.is_null() {
+            unsafe { pyo3::ffi::PyErr_Clear() };
+            return false;
+        }
+        let read = unsafe { read_compact_rank(obj) };
+        unsafe { pyo3::ffi::Py_DECREF(obj) };
+        if read.is_some() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Read a token id from a Python object, reading a plain in-range `int` with a
@@ -310,6 +425,7 @@ impl TiktokenBuffer {
 
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+    COMPACT_INT_LAYOUT_OK.store(compact_int_layout_is_valid(), Ordering::Relaxed);
     m.add_class::<CoreBPE>()?;
     Ok(())
 }
