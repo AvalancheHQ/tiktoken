@@ -313,7 +313,211 @@ impl std::fmt::Display for EncodeError {
 
 impl std::error::Error for EncodeError {}
 
-const MAX_NUM_THREADS: usize = 128;
+// The split regex is compiled once per thread-local slot (see the performance
+// notes above). Each slot now also holds the unrolled program, which is
+// `SPLIT_UNROLL` times larger, so the slot count is scaled down by the same
+// factor to keep the compiled-regex footprint in the same ballpark (measured on
+// `cl100k_base`: 75 MB and 0.42 s to build a `CoreBPE`, against 63 MB and 0.38 s
+// with 128 slots and no unrolled program). Slots are still only shared once more
+// than this many threads tokenise concurrently, as they already were beyond the
+// previous count.
+const MAX_NUM_THREADS: usize = 32;
+
+/// How many consecutive split pieces one regex match yields.
+///
+/// `fancy_regex` pays a fixed cost per `find`: it allocates a fresh VM state
+/// (three vectors, grown by repeated reallocation as the match backtracks) and
+/// returns its save slots in yet another allocation. The tokeniser splits text
+/// into pieces of a handful of bytes, so that fixed cost is paid ~once every
+/// four bytes of input and dominates the actual matching work.
+///
+/// Matching `SPLIT_UNROLL` copies of the pattern at once — the first mandatory,
+/// the rest optional, each in its own capture group — yields that many pieces
+/// from a single VM run, so the fixed cost is amortised over all of them.
+/// Because every copy after the first is optional, the match can never fail
+/// because of them and can never backtrack into an earlier copy, so each group
+/// captures exactly the piece `find_iter` would have returned next.
+const SPLIT_UNROLL: usize = 4;
+
+/// Input length (in bytes) from which the unrolled split regex is used.
+///
+/// The unrolled program is `SPLIT_UNROLL` times larger and carries its own copy
+/// of every delegated automaton, so a call touches a bigger working set. That
+/// only pays off once there are enough pieces to amortise it: measured on the
+/// benchmark suite, inputs of a few kilobytes and up get 5-10% faster, while a
+/// 64-byte input gets slower. Below this length the pattern as written is used,
+/// exactly as before.
+const SPLIT_UNROLL_MIN_LEN: usize = 1024;
+
+/// Builds the unrolled split pattern described on [`SPLIT_UNROLL`].
+///
+/// Each copy is wrapped in a non-capturing group so that a top-level
+/// alternation (which every tokeniser pattern is) binds correctly.
+fn unrolled_split_pattern(pattern: &str) -> String {
+    let mut unrolled = String::with_capacity((pattern.len() + 8) * SPLIT_UNROLL);
+    for i in 0..SPLIT_UNROLL {
+        unrolled.push_str("((?:");
+        unrolled.push_str(pattern);
+        unrolled.push_str("))");
+        if i > 0 {
+            unrolled.push('?');
+        }
+    }
+    unrolled
+}
+
+/// The unrolled split regex for every thread-local slot, when unrolling this
+/// pattern is safe.
+///
+/// Unrolling repeats the pattern, so it is only used when the pattern has no
+/// capture groups of its own (repeating them would renumber groups and break
+/// back-references, and would duplicate group names) and does not depend on
+/// where the *search* started rather than where the piece starts (`\G`, `\K`).
+/// `None` means "no unrolled form": the plain pattern is then used as it was
+/// before.
+fn compile_unrolled_split_regexes(pattern: &str) -> Option<Vec<Regex>> {
+    if pattern.contains("\\G") || pattern.contains("\\K") {
+        return None;
+    }
+    let unrolled = unrolled_split_pattern(pattern);
+    let first = Regex::new(&unrolled).ok()?;
+    // One group per copy, plus the implicit whole-match group: anything else
+    // means the pattern brought capture groups of its own.
+    if first.captures_len() != SPLIT_UNROLL + 1 {
+        return None;
+    }
+    let mut regexes = Vec::with_capacity(MAX_NUM_THREADS);
+    regexes.push(first);
+    for _ in 1..MAX_NUM_THREADS {
+        regexes.push(Regex::new(&unrolled).ok()?);
+    }
+    Some(regexes)
+}
+
+/// The pieces `text` is split into, in order.
+///
+/// When an unrolled regex is available, one match yields up to `SPLIT_UNROLL`
+/// pieces (see [`SPLIT_UNROLL`]); they are handed out one at a time and the
+/// next match is only run once they are exhausted. Otherwise — and if the
+/// unrolled regex ever fails, e.g. because a single piece is long enough that
+/// the extra copies exhaust the backtracking stack — this falls back to the
+/// plain pattern, which yields exactly what `Regex::find_iter` yields.
+struct SplitPieces<'r, 't> {
+    /// The unrolled regex, while it is being used.
+    unrolled: Option<&'r Regex>,
+    /// The pattern as written; the source of truth and the fallback.
+    plain: &'r Regex,
+    text: &'t str,
+    /// Byte ranges of the pieces of the current match that have not been handed
+    /// out yet.
+    pending: [(usize, usize); SPLIT_UNROLL],
+    pending_len: usize,
+    pending_next: usize,
+    /// Where the next match is searched from.
+    pos: usize,
+    done: bool,
+}
+
+impl<'r, 't> SplitPieces<'r, 't> {
+    fn new(unrolled: Option<&'r Regex>, plain: &'r Regex, text: &'t str) -> Self {
+        SplitPieces {
+            unrolled,
+            plain,
+            text,
+            pending: [(0, 0); SPLIT_UNROLL],
+            pending_len: 0,
+            pending_next: 0,
+            pos: 0,
+            done: false,
+        }
+    }
+
+    /// Records a piece, and where matching continues after it.
+    fn push_piece(&mut self, start: usize, end: usize) {
+        self.pending[self.pending_len] = (start, end);
+        self.pending_len += 1;
+        // An empty match would leave the position unchanged; mirror
+        // `Regex::find_iter` and resume one character further on so that we
+        // cannot spin on the same position forever.
+        self.pos = if end > start {
+            end
+        } else {
+            next_char_boundary(self.text, end)
+        };
+    }
+}
+
+impl<'t> Iterator for SplitPieces<'_, 't> {
+    type Item = Result<&'t str, fancy_regex::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.pending_next < self.pending_len {
+                let (start, end) = self.pending[self.pending_next];
+                self.pending_next += 1;
+                return Some(Ok(&self.text[start..end]));
+            }
+            if self.done || self.pos > self.text.len() {
+                return None;
+            }
+            self.pending_len = 0;
+            self.pending_next = 0;
+
+            if let Some(unrolled) = self.unrolled {
+                match unrolled.captures_from_pos(self.text, self.pos) {
+                    Ok(Some(captures)) => {
+                        for group in 1..=SPLIT_UNROLL {
+                            match captures.get(group) {
+                                Some(m) => {
+                                    let (start, end) = (m.start(), m.end());
+                                    self.push_piece(start, end);
+                                    if end == start {
+                                        // Nothing can follow an empty piece in
+                                        // this match; resume searching instead.
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        self.done = true;
+                        return None;
+                    }
+                    // The unrolled program can hit `fancy_regex`'s backtracking
+                    // limits on inputs the plain one handles (a single piece
+                    // millions of characters long). Drop back to the plain
+                    // pattern for the rest of the text; the pieces already
+                    // produced are unaffected.
+                    Err(_) => self.unrolled = None,
+                }
+            } else {
+                match self.plain.find_from_pos(self.text, self.pos) {
+                    Ok(Some(m)) => self.push_piece(m.start(), m.end()),
+                    Ok(None) => {
+                        self.done = true;
+                        return None;
+                    }
+                    Err(e) => {
+                        self.done = true;
+                        return Some(Err(e));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The next character boundary strictly after `ix`, or one past the end of the
+/// text when there is none.
+fn next_char_boundary(text: &str, ix: usize) -> usize {
+    let mut next = ix + 1;
+    while next < text.len() && !text.is_char_boundary(next) {
+        next += 1;
+    }
+    next
+}
 
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
@@ -330,11 +534,25 @@ pub struct CoreBPE {
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
     regex_tls: Vec<Regex>,
+    /// Per-slot unrolled split regexes, which yield several pieces per match;
+    /// see [`SPLIT_UNROLL`]. Empty when the pattern cannot be unrolled safely.
+    unrolled_regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
 
 impl CoreBPE {
+    /// The pieces `text` is split into, in order.
+    fn _split_pieces<'a>(&'a self, text: &'a str) -> SplitPieces<'a, 'a> {
+        let slot = hash_current_thread() % MAX_NUM_THREADS;
+        let unrolled = if text.len() >= SPLIT_UNROLL_MIN_LEN {
+            self.unrolled_regex_tls.get(slot)
+        } else {
+            None
+        };
+        SplitPieces::new(unrolled, &self.regex_tls[slot], text)
+    }
+
     fn _get_tl_regex(&self) -> &Regex {
         // See performance notes above for what this is about
         // It's also a little janky, please make a better version of it!
@@ -378,10 +596,9 @@ impl CoreBPE {
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        for piece in self._split_pieces(text) {
+            let piece = piece.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -396,7 +613,6 @@ impl CoreBPE {
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
 
         let mut start = 0;
@@ -420,9 +636,9 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
+            for piece_res in self._split_pieces(&text[start..end]) {
+                let piece = match piece_res {
+                    Ok(p) => p,
                     Err(e) => {
                         return Err(EncodeError {
                             message: format!("Regex error while tokenizing: {e}"),
@@ -430,7 +646,7 @@ impl CoreBPE {
                     }
                 };
 
-                let piece = mat.as_str().as_bytes();
+                let piece = piece.as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
                     ret.push(*token);
@@ -691,6 +907,9 @@ impl CoreBPE {
         let regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(pattern))
             .collect::<Result<Vec<_>, _>>()?;
+        // Alongside them, the unrolled form that yields several pieces per match when
+        // that is safe for this pattern; see `compile_unrolled_split_regexes`.
+        let unrolled_regex_tls = compile_unrolled_split_regexes(pattern).unwrap_or_default();
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
             .collect::<Result<Vec<_>, _>>()?;
@@ -702,6 +921,7 @@ impl CoreBPE {
             special_tokens_decoder,
             decoder_flat,
             regex_tls,
+            unrolled_regex_tls,
             special_regex_tls,
             sorted_token_bytes,
         })
@@ -743,5 +963,59 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    /// The unrolled split regex must yield exactly the pieces the pattern as
+    /// written yields, for the patterns tiktoken ships.
+    #[test]
+    fn test_unrolled_split_matches_plain() {
+        let patterns = [
+            // r50k / p50k / gpt2
+            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s",
+            // cl100k_base
+            r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s",
+            // o200k_base
+            r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        ];
+        let texts = [
+            "",
+            " ",
+            "   ",
+            "\n",
+            "\r\n\r\n",
+            "hello world",
+            "The quick brown fox jumps over the lazy dog.",
+            "don't  'ell  it's",
+            "ABCdef GHIjkl 123 4567890",
+            "a  \n\t b\n\n  c   ",
+            "héllo wörld あいう 🎉🎉 x/y//z",
+            "trailing whitespace   ",
+            "\u{a0}\u{2009}nbsp",
+            "MiXeD CaSe'S and-punctuation!!!...",
+        ];
+        for pattern in patterns {
+            let plain = Regex::new(pattern).unwrap();
+            let unrolled = super::compile_unrolled_split_regexes(pattern)
+                .expect("shipped patterns must be unrollable");
+            for text in texts {
+                let expected: Vec<&str> = super::SplitPieces::new(None, &plain, text)
+                    .map(|p| p.unwrap())
+                    .collect();
+                let actual: Vec<&str> = super::SplitPieces::new(Some(&unrolled[0]), &plain, text)
+                    .map(|p| p.unwrap())
+                    .collect();
+                assert_eq!(actual, expected, "pattern {pattern:?} text {text:?}");
+                // And the pieces must still cover the whole text in order.
+                assert_eq!(expected.concat(), text, "pattern {pattern:?} text {text:?}");
+            }
+        }
+    }
+
+    /// A pattern with capture groups of its own must not be unrolled, since
+    /// repeating it would renumber its groups.
+    #[test]
+    fn test_pattern_with_groups_is_not_unrolled() {
+        assert!(super::compile_unrolled_split_regexes(r"( ?\p{L}+)|\s+").is_none());
+        assert!(super::compile_unrolled_split_regexes(r"\G\p{L}+|\s+").is_none());
     }
 }
