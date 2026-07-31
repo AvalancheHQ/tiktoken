@@ -316,12 +316,10 @@ impl std::error::Error for EncodeError {}
 // The split regex is compiled once per thread-local slot (see the performance
 // notes above). Each slot now also holds the unrolled program, which is
 // `SPLIT_UNROLL` times larger, so the slot count is scaled down by the same
-// factor to keep the compiled-regex footprint in the same ballpark (measured on
-// `cl100k_base`: 75 MB and 0.42 s to build a `CoreBPE`, against 63 MB and 0.38 s
-// with 128 slots and no unrolled program). Slots are still only shared once more
-// than this many threads tokenise concurrently, as they already were beyond the
-// previous count.
-const MAX_NUM_THREADS: usize = 32;
+// factor to keep the compiled-regex footprint in the same ballpark. Slots are
+// still only shared once more than this many threads tokenise concurrently, as
+// they already were beyond the previous count.
+const MAX_NUM_THREADS: usize = 64;
 
 /// How many consecutive split pieces one regex match yields.
 ///
@@ -337,7 +335,7 @@ const MAX_NUM_THREADS: usize = 32;
 /// Because every copy after the first is optional, the match can never fail
 /// because of them and can never backtrack into an earlier copy, so each group
 /// captures exactly the piece `find_iter` would have returned next.
-const SPLIT_UNROLL: usize = 4;
+const SPLIT_UNROLL: usize = 2;
 
 /// Input length (in bytes) from which the unrolled split regex is used.
 ///
