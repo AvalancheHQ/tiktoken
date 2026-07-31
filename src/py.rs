@@ -167,25 +167,25 @@ impl CoreBPE {
         // `py.detach` does, so multi-threaded decoding on a GIL build won't
         // overlap here.
         if let Ok(list) = tokens.downcast::<PyList>() {
-            // Resolve every token to its byte slice and accumulate total length.
-            let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
+            // Resolve every token to its decode-table entry and accumulate the
+            // total length. Entries are borrowed by pointer (8 bytes) rather
+            // than as byte slices (16 bytes), halving the traffic through this
+            // scratch buffer.
+            let mut entries = Vec::with_capacity(list.len());
             let mut total_len = 0usize;
             for item in list.iter() {
                 let token = read_rank(&item)?;
-                let token_bytes = self.token_bytes(token).ok_or_else(|| {
+                let entry = self.token_entry(token).ok_or_else(|| {
                     pyo3::exceptions::PyKeyError::new_err(format!(
                         "Invalid token for decoding: {token}"
                     ))
                 })?;
-                total_len += token_bytes.len();
-                slices.push(token_bytes);
+                total_len += self.entry_len(entry);
+                entries.push(entry);
             }
             // Copy the resolved bytes directly into the final buffer.
-            let bytes = PyBytes::new_with(py, total_len, |mut buf| {
-                for s in &slices {
-                    buf[..s.len()].copy_from_slice(s);
-                    buf = &mut buf[s.len()..];
-                }
+            let bytes = PyBytes::new_with(py, total_len, |buf| {
+                self.write_token_bytes(&entries, buf);
                 Ok(())
             })?;
             return Ok(bytes.into());
