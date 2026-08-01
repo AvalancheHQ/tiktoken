@@ -315,6 +315,269 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+// Splitting the text with the tokeniser pattern dominates every encode call:
+// `fancy_regex` runs its backtracking VM once per piece, and a piece is only a
+// handful of bytes. Real text keeps presenting the *same short contexts* over
+// and over (" the", " and", ", ", " of", …), so the same VM run is repeated
+// thousands of times for the same bytes.
+//
+// The cache below memoises that decision: it maps the bytes at a piece start to
+// the length of the piece the regex produces there. On a hit the whole VM run
+// disappears and the piece is taken with a single table lookup.
+//
+// Reusing a decision at another position is only sound when the piece really is
+// a function of the bytes in the window, so an entry is only created when:
+//   * the window is entirely ASCII — then every byte is a whole character, so a
+//     piece ending inside the window has the context a one-character lookahead
+//     would read inside the window too, and
+//   * the piece ends at least two bytes before the end of the window.
+// Two window sizes are kept, because pieces range from single punctuation marks
+// to whole words: 8 bytes for pieces up to 6 bytes (the common case, and the
+// most reusable key), and 16 bytes for the longer pieces that the short window
+// cannot decide.
+//
+// Every stored entry comes from a real match against the haystack being split,
+// and a pattern may only use the cache at all if it passes the locality checks
+// in `split_cache_id_for`.
+const SHORT_WINDOW: usize = 8;
+const MAX_SHORT_PIECE: usize = SHORT_WINDOW - 2;
+const LONG_WINDOW: usize = 16;
+const MAX_LONG_PIECE: usize = LONG_WINDOW - 2;
+const SPLIT_CACHE_LOG: u32 = 12;
+const SPLIT_CACHE_SIZE: usize = 1 << SPLIT_CACHE_LOG;
+/// High bit of every byte; zero iff every byte of the window is ASCII.
+const NON_ASCII_MASK_64: u64 = 0x8080_8080_8080_8080;
+const NON_ASCII_MASK_128: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080;
+
+/// Direct-mapped table of split decisions, keyed on a window of input bytes.
+struct SplitTable<K: Copy + PartialEq> {
+    keys: Box<[K; SPLIT_CACHE_SIZE]>,
+    /// Identity of the `CoreBPE` an entry belongs to, so that several
+    /// tokenisers alive in the same process never read each other's entries.
+    owners: Box<[u32; SPLIT_CACHE_SIZE]>,
+    /// Piece length in bytes; 0 means "empty slot".
+    lens: Box<[u8; SPLIT_CACHE_SIZE]>,
+}
+
+impl<K: Copy + PartialEq + Default> SplitTable<K> {
+    fn new() -> Self {
+        SplitTable {
+            keys: Box::new([K::default(); SPLIT_CACHE_SIZE]),
+            owners: Box::new([0; SPLIT_CACHE_SIZE]),
+            lens: Box::new([0; SPLIT_CACHE_SIZE]),
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, key: K, slot: usize, id: u32) -> Option<usize> {
+        let len = self.lens[slot];
+        if len != 0 && self.keys[slot] == key && self.owners[slot] == id {
+            Some(len as usize)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn put(&mut self, key: K, slot: usize, id: u32, len: usize) {
+        self.keys[slot] = key;
+        self.owners[slot] = id;
+        self.lens[slot] = len as u8;
+    }
+}
+
+/// Thread-local cache of split decisions.
+///
+/// It is thread-local (rather than shared behind a lock) on purpose: the
+/// tokeniser is used from several Python threads at once and the performance
+/// notes above are explicit that a shared, lock-protected cache is what made
+/// the original implementation slow.
+struct SplitCache {
+    short: SplitTable<u64>,
+    long: SplitTable<u128>,
+}
+
+impl SplitCache {
+    fn new() -> Self {
+        SplitCache {
+            short: SplitTable::new(),
+            long: SplitTable::new(),
+        }
+    }
+}
+
+#[inline(always)]
+fn slot_of(hash: u64) -> usize {
+    (hash.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SPLIT_CACHE_LOG)) as usize
+}
+
+thread_local! {
+    static SPLIT_CACHE: std::cell::RefCell<SplitCache> =
+        std::cell::RefCell::new(SplitCache::new());
+}
+
+/// Index of the next byte that starts a character, mirroring what
+/// `fancy_regex`'s match iterator does after an empty match.
+#[inline]
+fn next_char_boundary(bytes: &[u8], mut i: usize) -> usize {
+    i += 1;
+    while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+        i += 1;
+    }
+    i
+}
+
+/// The 8-byte window at `pos`, if it exists and is all ASCII.
+#[inline(always)]
+fn short_window(bytes: &[u8], pos: usize) -> Option<u64> {
+    let window = bytes.get(pos..pos + SHORT_WINDOW)?;
+    let key = u64::from_le_bytes(window.try_into().unwrap());
+    (key & NON_ASCII_MASK_64 == 0).then_some(key)
+}
+
+/// The 16-byte window at `pos`, if it exists and is all ASCII.
+#[inline(always)]
+fn long_window(bytes: &[u8], pos: usize) -> Option<u128> {
+    let window = bytes.get(pos..pos + LONG_WINDOW)?;
+    let key = u128::from_le_bytes(window.try_into().unwrap());
+    (key & NON_ASCII_MASK_128 == 0).then_some(key)
+}
+
+static NEXT_SPLIT_CACHE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Decides whether split decisions for `pattern` may be cached.
+///
+/// Two things have to hold for a cached decision to be reusable at another
+/// position: the pattern must not look at anything *before* the piece start
+/// (no lookbehind, no `^`/`\A`/`\b`, no `\G`, no back-references), and a short
+/// match must be decided by the bytes inside the window. The first is a
+/// structural property of the parsed pattern; the second is checked directly
+/// against the compiled regex by `verify_split_locality`.
+fn split_cache_id_for(pattern: &str, regex: &Regex) -> Option<u32> {
+    let tree = fancy_regex::Expr::parse_tree(pattern).ok()?;
+    if !has_only_local_constructs(&tree.expr) {
+        return None;
+    }
+    if !verify_split_locality(regex) {
+        return None;
+    }
+    Some(NEXT_SPLIT_CACHE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+fn has_only_local_constructs(expr: &fancy_regex::Expr) -> bool {
+    use fancy_regex::{Assertion, Expr, LookAround};
+    match expr {
+        Expr::Assertion(assertion) => matches!(
+            assertion,
+            // End-of-text/line assertions are fine: a match that relies on one
+            // reaches the end of the haystack, and such a match is far longer
+            // than the pieces we are allowed to cache.
+            Assertion::EndText | Assertion::EndLine { .. }
+        ),
+        Expr::LookAround(child, kind) => {
+            matches!(kind, LookAround::LookAhead | LookAround::LookAheadNeg)
+                && has_only_local_constructs(child)
+        }
+        Expr::Concat(children) | Expr::Alt(children) => {
+            children.iter().all(has_only_local_constructs)
+        }
+        Expr::Group(child) | Expr::AtomicGroup(child) => has_only_local_constructs(child),
+        Expr::Repeat { child, .. } => has_only_local_constructs(child),
+        Expr::Empty | Expr::Any { .. } | Expr::Literal { .. } | Expr::Delegate { .. } => true,
+        // Anything that can depend on preceding text or on other groups
+        // (`\G`, `\K`, back-references, conditionals, subroutines, …).
+        _ => false,
+    }
+}
+
+/// Checks on sample text that a cacheable match is fully determined by the
+/// window at its start: the same window followed by different text must yield
+/// the same piece, for both window sizes.
+fn verify_split_locality(regex: &Regex) -> bool {
+    const ALPHABET: [&str; 26] = [
+        "a",
+        "b",
+        "z",
+        "A",
+        "Q",
+        "0",
+        "7",
+        " ",
+        "  ",
+        "\t",
+        "\n",
+        "\r\n",
+        ".",
+        ",",
+        "'",
+        "!",
+        "-",
+        "_",
+        "<",
+        "|",
+        ">",
+        "é",
+        "中",
+        "🙂",
+        "word",
+        "loremipsum",
+    ];
+    const TAILS: [&str; 8] = ["", "a", " ", "\n", "0", ".", "  \n", "aaaaaaaa"];
+
+    let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+
+    let mut text = String::with_capacity(64);
+    for _ in 0..200 {
+        text.clear();
+        let parts = 6 + (next() % 8) as usize;
+        for _ in 0..parts {
+            text.push_str(ALPHABET[(next() % ALPHABET.len() as u64) as usize]);
+        }
+        let bytes = text.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let mat = match regex.find_from_pos(&text, pos) {
+                Ok(Some(mat)) => mat,
+                _ => break,
+            };
+            if mat.start() == mat.end() {
+                pos = next_char_boundary(bytes, mat.end());
+                continue;
+            }
+            let len = mat.end() - mat.start();
+            if mat.start() == pos {
+                // Check exactly what caching relies on: for every window that
+                // would be stored, the same window followed by different text
+                // must produce the same piece.
+                let windows = [
+                    (len <= MAX_SHORT_PIECE && short_window(bytes, pos).is_some())
+                        .then_some(SHORT_WINDOW),
+                    (len <= MAX_LONG_PIECE && long_window(bytes, pos).is_some())
+                        .then_some(LONG_WINDOW),
+                ];
+                for window_len in windows.into_iter().flatten() {
+                    let window = &text[pos..pos + window_len];
+                    for tail in TAILS {
+                        let probe = format!("{window}{tail}");
+                        match regex.find_from_pos(&probe, 0) {
+                            Ok(Some(m)) if m.start() == 0 && m.end() == len => {}
+                            _ => return false,
+                        }
+                    }
+                }
+            }
+            pos = mat.end();
+        }
+    }
+    true
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -332,6 +595,9 @@ pub struct CoreBPE {
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
+    /// Identity used for this tokeniser's entries in the thread-local split
+    /// cache, or `None` when the pattern is not eligible for caching.
+    split_cache_id: Option<u32>,
 }
 
 impl CoreBPE {
@@ -375,18 +641,106 @@ impl CoreBPE {
         Ok(ret)
     }
 
+    /// Yields the pieces the tokeniser pattern splits `text` into, exactly as
+    /// `regex.find_iter(text)` would.
+    ///
+    /// When the pattern is eligible (see `split_cache_id_for`), short pieces
+    /// are resolved from the thread-local split cache instead of running
+    /// `fancy_regex`'s backtracking VM again for bytes that were already split
+    /// before. Cache entries only ever come from a real match against this
+    /// haystack, so a cold cache produces exactly the same pieces as `find_iter`.
+    fn for_each_piece<F>(&self, text: &str, regex: &Regex, mut f: F) -> fancy_regex::Result<()>
+    where
+        F: FnMut(&str),
+    {
+        let Some(id) = self.split_cache_id else {
+            for mat in regex.find_iter(text) {
+                f(mat?.as_str());
+            }
+            return Ok(());
+        };
+
+        SPLIT_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            let bytes = text.as_bytes();
+            let mut last_end = 0usize;
+            let mut last_match: Option<usize> = None;
+
+            while last_end <= bytes.len() {
+                let pos = last_end;
+                // Short window first: it decides most pieces and is the key
+                // that generalises best across contexts.
+                let short_key = short_window(bytes, pos);
+                let short_slot = short_key.map(slot_of);
+                if let (Some(key), Some(slot)) = (short_key, short_slot)
+                    && let Some(len) = cache.short.get(key, slot, id)
+                {
+                    let end = pos + len;
+                    f(&text[pos..end]);
+                    last_match = Some(end);
+                    last_end = end;
+                    continue;
+                }
+                // Longer pieces (whole words, mostly) need a wider window.
+                let long_key = long_window(bytes, pos);
+                let long_slot = long_key.map(|key| slot_of((key ^ (key >> 64)) as u64));
+                if let (Some(key), Some(slot)) = (long_key, long_slot)
+                    && let Some(len) = cache.long.get(key, slot, id)
+                {
+                    let end = pos + len;
+                    f(&text[pos..end]);
+                    last_match = Some(end);
+                    last_end = end;
+                    continue;
+                }
+
+                let mat = match regex.find_from_pos(text, pos)? {
+                    Some(mat) => mat,
+                    None => break,
+                };
+                let (start, end) = (mat.start(), mat.end());
+                if start == end {
+                    // Mirror `fancy_regex::Matches`: after an empty match, move
+                    // on and never yield an empty match right after a match.
+                    last_end = next_char_boundary(bytes, end);
+                    if Some(end) == last_match {
+                        continue;
+                    }
+                } else {
+                    last_end = end;
+                    if start == pos {
+                        let len = end - start;
+                        if len <= MAX_SHORT_PIECE
+                            && let (Some(key), Some(slot)) = (short_key, short_slot)
+                        {
+                            cache.short.put(key, slot, id, len);
+                        } else if len <= MAX_LONG_PIECE
+                            && let (Some(key), Some(slot)) = (long_key, long_slot)
+                        {
+                            cache.long.put(key, slot, id, len);
+                        }
+                    }
+                }
+                last_match = Some(end);
+                f(&text[start..end]);
+            }
+            Ok(())
+        })
+    }
+
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
         let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        self.for_each_piece(text, regex, |piece| {
+            let piece = piece.as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
             }
-        }
+        })
+        .unwrap();
         ret
     }
 
@@ -420,25 +774,21 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
-                    Err(e) => {
-                        return Err(EncodeError {
-                            message: format!("Regex error while tokenizing: {e}"),
-                        });
-                    }
-                };
-
-                let piece = mat.as_str().as_bytes();
+            let split = self.for_each_piece(&text[start..end], regex, |piece| {
+                let piece = piece.as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
                     ret.push(*token);
-                    continue;
+                    return;
                 }
                 let tokens = byte_pair_encode(piece, &self.encoder);
                 last_piece_token_len = tokens.len();
                 ret.extend(&tokens);
+            });
+            if let Err(e) = split {
+                return Err(EncodeError {
+                    message: format!("Regex error while tokenizing: {e}"),
+                });
             }
 
             match next_special {
@@ -695,6 +1045,11 @@ impl CoreBPE {
             .map(|_| Regex::new(&special_pattern))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Only patterns whose split decisions are local (see
+        // `split_cache_id_for`) may use the thread-local split cache; anything
+        // else keeps splitting with `find_iter` exactly as before.
+        let split_cache_id = split_cache_id_for(pattern, &regex_tls[0]);
+
         Ok(Self {
             encoder,
             special_tokens_encoder,
@@ -704,6 +1059,7 @@ impl CoreBPE {
             regex_tls,
             special_regex_tls,
             sorted_token_bytes,
+            split_cache_id,
         })
     }
 
@@ -743,5 +1099,146 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PAT: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K_PAT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    fn core_bpe(pattern: &str) -> crate::CoreBPE {
+        // A tiny vocabulary is enough: this only exercises the splitting.
+        let mut encoder: HashMap<Vec<u8>, Rank> = HashMap::default();
+        for b in 0u16..=255 {
+            encoder.insert(vec![b as u8], b as Rank);
+        }
+        crate::CoreBPE::new_internal(encoder, HashMap::default(), pattern).unwrap()
+    }
+
+    fn pieces_with_cache(bpe: &crate::CoreBPE, text: &str) -> Vec<String> {
+        let regex = bpe._get_tl_regex();
+        let mut out = Vec::new();
+        bpe.for_each_piece(text, regex, |piece| out.push(piece.to_string()))
+            .unwrap();
+        out
+    }
+
+    fn pieces_with_regex(bpe: &crate::CoreBPE, text: &str) -> Vec<String> {
+        bpe._get_tl_regex()
+            .find_iter(text)
+            .map(|m| m.unwrap().as_str().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_split_cache_is_enabled_for_shipped_patterns() {
+        for pattern in [R50K_PAT, CL100K_PAT, O200K_PAT] {
+            assert!(
+                core_bpe(pattern).split_cache_id.is_some(),
+                "expected split caching for {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_cache_rejects_non_local_patterns() {
+        // `\G`, lookbehind and `^` all depend on more than the bytes at the
+        // piece start, so they must keep the plain `find_iter` path.
+        for pattern in [r"\Ga+|.", r"(?<=a)b|.", r"^a|."] {
+            assert!(
+                core_bpe(pattern).split_cache_id.is_none(),
+                "expected no split caching for {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cached_split_matches_find_iter() {
+        let texts = [
+            "",
+            "a",
+            "hello world",
+            "The quick brown fox jumps over the lazy dog. The quick brown fox!",
+            "   leading and    trailing   ",
+            "line one\nline two\r\n\r\nline three\n\n\n",
+            "punctuation!!! ...,,, ??? '''",
+            "it's a dog's life, isn't it? I'd say it's fine",
+            "héllo wörld é中文🙂 mixed 123 4567 89",
+            "\t\ttabs\tand \n newlines \n\t ",
+            "1234567890 12 345 6789 0",
+            "a  b   c    d     e      f",
+            "byte pair encoding compresses reversible representations repeatedly",
+            "supercalifragilisticexpialidocious supercalifragilisticexpialidocious",
+            "'s 's's ''s 't 'll 've 're 'd",
+            "trailing whitespace at end of text   ",
+        ];
+        for pattern in [R50K_PAT, CL100K_PAT, O200K_PAT] {
+            let bpe = core_bpe(pattern);
+            for text in texts {
+                // Run twice so the second pass reads the entries the first pass wrote.
+                for _ in 0..2 {
+                    assert_eq!(
+                        pieces_with_cache(&bpe, text),
+                        pieces_with_regex(&bpe, text),
+                        "pieces diverged for {text:?} with pattern {pattern}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cached_split_matches_find_iter_randomised() {
+        const ALPHABET: [&str; 27] = [
+            "a",
+            "b",
+            "Z",
+            "0",
+            "9",
+            " ",
+            "  ",
+            "\t",
+            "\n",
+            "\r\n",
+            ".",
+            ",",
+            "'",
+            "!",
+            "-",
+            "<",
+            "|",
+            ">",
+            "é",
+            "中",
+            "🙂",
+            "\u{a0}",
+            "encoding",
+            "loremipsumdolor",
+            " reversible",
+            "1234567890123456789",
+            "wörter",
+        ];
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for pattern in [R50K_PAT, CL100K_PAT, O200K_PAT] {
+            let bpe = core_bpe(pattern);
+            for _ in 0..2000 {
+                let mut text = String::new();
+                let parts = (next() % 24) as usize;
+                for _ in 0..parts {
+                    text.push_str(ALPHABET[(next() % ALPHABET.len() as u64) as usize]);
+                }
+                assert_eq!(
+                    pieces_with_cache(&bpe, &text),
+                    pieces_with_regex(&bpe, &text),
+                    "pieces diverged for {text:?} with pattern {pattern}"
+                );
+            }
+        }
     }
 }
