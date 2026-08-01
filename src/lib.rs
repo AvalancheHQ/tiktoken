@@ -5,6 +5,7 @@ use std::thread;
 use fancy_regex::Regex;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+use regex_automata::{Anchored, Input, meta::Regex as MetaRegex};
 use rustc_hash::FxHashMap as HashMap;
 
 #[cfg(feature = "python")]
@@ -315,6 +316,235 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+// Splitting the text into pieces dominates encoding: profiles put ~80% of
+// `encode_ordinary` inside `fancy_regex`'s backtracking VM. The VM is only
+// needed because the tokeniser patterns end with a look-around alternative
+// (`\s+(?!\S)`); everything before it is plain regex syntax. But `fancy_regex`
+// pays for the VM on *every* piece: a fresh `State` (three heap allocations and
+// a zero-fill), a backtrack stack push per alternative it tries, atomic-group
+// save/restore bookkeeping for the possessive quantifiers, and one delegated
+// `regex-automata` search per alternative-and-atom.
+//
+// `fast_split` builds a second matcher for the leading run of alternatives that
+// `regex-automata` can run on its own, and `Pieces` tries it — anchored at the
+// position where the previous piece ended — before touching `fancy_regex`. On a
+// hit the piece is produced by a single forward automaton pass with no VM, no
+// backtrack stack and no per-piece allocation.
+//
+// Why the piece is the same one `find_iter` would return: the fast matcher is a
+// *prefix* of the pattern's ordered alternation, so if any of its alternatives
+// matches at the current position, leftmost-first semantics say the full pattern
+// matches there too, and picks the very same alternative. When none of them
+// matches, `fancy_regex` is consulted exactly as before, so the remaining
+// alternatives (the look-around ones) still decide those positions.
+mod fast_split {
+    use regex_automata::meta::Regex as MetaRegex;
+
+    /// Splits `pattern` at its top-level `|`, ignoring `|` inside escapes,
+    /// character classes and groups. Returns `None` if the pattern is not
+    /// balanced (the regex compiler rejects those anyway).
+    fn top_level_alternatives(pattern: &str) -> Option<Vec<&str>> {
+        let bytes = pattern.as_bytes();
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let mut depth = 0usize;
+        let mut in_class = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                b'[' if !in_class => in_class = true,
+                b']' if in_class => in_class = false,
+                b'(' if !in_class => depth += 1,
+                b')' if !in_class => depth = depth.checked_sub(1)?,
+                b'|' if !in_class && depth == 0 => {
+                    parts.push(&pattern[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if in_class || depth != 0 {
+            return None;
+        }
+        parts.push(&pattern[start..]);
+        Some(parts)
+    }
+
+    /// Drops possessive markers (`?+`, `*+`, `++`, `{n,m}+`), which `regex-automata`
+    /// cannot express, turning the quantifier into its greedy form.
+    ///
+    /// This is a *candidate* rewrite only: a greedy quantifier can give back
+    /// characters where a possessive one cannot, so the result is verified
+    /// against the real pattern before it is used (see `derive`).
+    fn strip_possessive(alt: &str) -> String {
+        let mut out = String::with_capacity(alt.len());
+        let mut in_class = false;
+        let mut prev_is_quantifier = false;
+        let mut chars = alt.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    out.push('\\');
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                    prev_is_quantifier = false;
+                }
+                '[' if !in_class => {
+                    in_class = true;
+                    out.push('[');
+                    prev_is_quantifier = false;
+                }
+                ']' if in_class => {
+                    in_class = false;
+                    out.push(']');
+                    prev_is_quantifier = false;
+                }
+                '+' if !in_class && prev_is_quantifier => {
+                    // Possessive marker: drop it, leaving the greedy quantifier.
+                    prev_is_quantifier = false;
+                }
+                _ => {
+                    out.push(c);
+                    prev_is_quantifier = !in_class && matches!(c, '?' | '*' | '+' | '}');
+                }
+            }
+        }
+        out
+    }
+
+    /// Builds the fast-path pattern for `pattern`: the longest run of leading
+    /// top-level alternatives that `regex-automata` accepts on its own.
+    ///
+    /// Returns `None` when there is nothing to gain — either no alternative
+    /// qualifies, or every one of them does (in which case `fancy_regex` already
+    /// runs the whole pattern on an automaton and never enters its VM).
+    pub(crate) fn derive(pattern: &str) -> Option<MetaRegex> {
+        let alts = top_level_alternatives(pattern)?;
+        let mut kept: Vec<String> = Vec::new();
+        for alt in &alts {
+            let candidate = strip_possessive(alt);
+            // `regex-automata` rejects everything that forces the VM
+            // (look-around, back-references, `\G`, `\K`), so compiling the
+            // alternative on its own is the membership test.
+            if MetaRegex::new(&candidate).is_err() {
+                break;
+            }
+            kept.push(candidate);
+        }
+        if kept.is_empty() || kept.len() == alts.len() {
+            return None;
+        }
+        MetaRegex::new(&kept.join("|")).ok()
+    }
+
+    /// Strings the derived matcher is checked against before it is trusted.
+    ///
+    /// All strings of length <= 3 over an alphabet covering the character
+    /// classes the tokeniser patterns discriminate on (letters, digits,
+    /// apostrophes, symbols, every kind of whitespace, and non-ASCII), plus a
+    /// few longer natural-language cases.
+    pub(crate) fn verification_corpus() -> Vec<String> {
+        const ALPHABET: [&str; 14] = [
+            "a", "Z", "5", "'", " ", "\t", "\n", "\r", "!", ".", "é", "中", "\u{a0}", "\u{0301}",
+        ];
+        let mut corpus: Vec<String> = Vec::with_capacity(4096);
+        for a in ALPHABET {
+            corpus.push(a.to_string());
+            for b in ALPHABET {
+                corpus.push(format!("{a}{b}"));
+                for c in ALPHABET {
+                    corpus.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+        corpus.extend(
+            [
+                "The quick brown fox jumps over the lazy dog.",
+                "It's 2024, isn't it?  Really    spaced   out.\n\n\tTabbed\r\nCRLF",
+                "don't  'tis 'LL 've 'RE mixed'Case",
+                "Ünïcödé — naïve café 中文字 🙂🙂 combining a\u{0301}",
+                "trailing whitespace   ",
+                "\n\n\n   \t\t  \r\n",
+                "12345 678 90 1,234.56",
+                "<|endoftext|> <|fim_prefix|>",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        corpus
+    }
+}
+
+/// Yields the same pieces as `regex.find_iter(text)`, but resolves the common
+/// ones with an anchored `regex-automata` search instead of `fancy_regex`'s
+/// backtracking VM. See the `fast_split` module comment for why this is sound.
+struct Pieces<'a> {
+    text: &'a str,
+    pos: usize,
+    fast: Option<&'a MetaRegex>,
+    full: &'a Regex,
+    done: bool,
+}
+
+impl<'a> Pieces<'a> {
+    #[inline]
+    fn new(text: &'a str, fast: Option<&'a MetaRegex>, full: &'a Regex) -> Self {
+        Pieces {
+            text,
+            pos: 0,
+            fast,
+            full,
+            done: false,
+        }
+    }
+}
+
+impl<'a> Iterator for Pieces<'a> {
+    type Item = Result<&'a str, fancy_regex::Error>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.pos >= self.text.len() {
+            return None;
+        }
+        if let Some(fast) = self.fast {
+            let input = Input::new(self.text)
+                .span(self.pos..self.text.len())
+                .anchored(Anchored::Yes);
+            if let Some(half) = fast.search_half(&input) {
+                let end = half.offset();
+                // An empty match would not make progress; leave those (and
+                // everything the fast matcher cannot decide) to `fancy_regex`.
+                if end > self.pos {
+                    let piece = &self.text[self.pos..end];
+                    self.pos = end;
+                    return Some(Ok(piece));
+                }
+            }
+        }
+        match self.full.find_from_pos(self.text, self.pos) {
+            Ok(Some(m)) if m.end() > m.start() => {
+                self.pos = m.end();
+                Some(Ok(m.as_str()))
+            }
+            // `find_iter` handles empty matches by advancing one character; the
+            // tokeniser patterns never produce them, so simply stop instead of
+            // risking an infinite loop.
+            Ok(_) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -330,6 +560,14 @@ pub struct CoreBPE {
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
     regex_tls: Vec<Regex>,
+    // Automaton for the leading run of split alternatives that `regex-automata`
+    // can run on its own, used to resolve most pieces without entering
+    // `fancy_regex`'s VM. Empty when the pattern gains nothing from it (see
+    // `fast_split::derive`) or when the derived matcher failed verification.
+    // One clone per thread-local slot: cloning a `meta::Regex` shares the
+    // compiled automaton but gives the clone its own scratch pool, so threads
+    // never contend on it.
+    fast_regex_tls: Vec<MetaRegex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
@@ -344,6 +582,13 @@ impl CoreBPE {
 
     fn _get_tl_special_regex(&self) -> &Regex {
         &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
+    }
+
+    /// The pieces of `text`, exactly as `find_iter` would produce them.
+    #[inline]
+    fn _pieces<'a>(&'a self, text: &'a str) -> Pieces<'a> {
+        let slot = hash_current_thread() % MAX_NUM_THREADS;
+        Pieces::new(text, self.fast_regex_tls.get(slot), &self.regex_tls[slot])
     }
 
     /// Resolves a token id to its decoded bytes, checking the regular decoder
@@ -378,10 +623,9 @@ impl CoreBPE {
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        for mat in self._pieces(text) {
+            let piece = mat.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -396,7 +640,6 @@ impl CoreBPE {
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
 
         let mut start = 0;
@@ -420,7 +663,7 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
+            for mat_res in self._pieces(&text[start..end]) {
                 let mat = match mat_res {
                     Ok(m) => m,
                     Err(e) => {
@@ -430,7 +673,7 @@ impl CoreBPE {
                     }
                 };
 
-                let piece = mat.as_str().as_bytes();
+                let piece = mat.as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
                     ret.push(*token);
@@ -695,6 +938,18 @@ impl CoreBPE {
             .map(|_| Regex::new(&special_pattern))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Derive the automaton fast path and only adopt it once it has been
+        // checked to split exactly like the pattern as written. Dropping the
+        // possessive markers is what makes the leading alternatives expressible
+        // as an automaton, and that rewrite is not sound for every pattern, so
+        // an unverified matcher is discarded rather than trusted.
+        let fast_regex_tls = match fast_split::derive(pattern) {
+            Some(fast) if Self::fast_split_matches_pattern(&fast, &regex_tls[0]) => {
+                (0..MAX_NUM_THREADS).map(|_| fast.clone()).collect()
+            }
+            _ => Vec::new(),
+        };
+
         Ok(Self {
             encoder,
             special_tokens_encoder,
@@ -702,9 +957,35 @@ impl CoreBPE {
             special_tokens_decoder,
             decoder_flat,
             regex_tls,
+            fast_regex_tls,
             special_regex_tls,
             sorted_token_bytes,
         })
+    }
+
+    /// Whether `fast` produces exactly the piece stream `full` does, over the
+    /// verification corpus.
+    fn fast_split_matches_pattern(fast: &MetaRegex, full: &Regex) -> bool {
+        for text in fast_split::verification_corpus() {
+            let mut expected = Vec::new();
+            for mat in full.find_iter(&text) {
+                match mat {
+                    Ok(m) => expected.push(m.as_str()),
+                    Err(_) => return false,
+                }
+            }
+            let mut actual = Vec::new();
+            for piece in Pieces::new(&text, Some(fast), full) {
+                match piece {
+                    Ok(p) => actual.push(p),
+                    Err(_) => return false,
+                }
+            }
+            if expected != actual {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn special_tokens(&self) -> HashSet<&str> {
@@ -725,7 +1006,60 @@ mod tests {
     use fancy_regex::Regex;
     use rustc_hash::FxHashMap as HashMap;
 
-    use crate::{Rank, byte_pair_split};
+    use crate::{Pieces, Rank, byte_pair_split, fast_split};
+
+    const R50K_PATTERN: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+
+    fn assert_same_pieces(pattern: &str) {
+        let full = Regex::new(pattern).unwrap();
+        let fast = fast_split::derive(pattern).expect("shipped patterns have a fast path");
+        for text in fast_split::verification_corpus() {
+            let expected: Vec<&str> = full.find_iter(&text).map(|m| m.unwrap().as_str()).collect();
+            let actual: Vec<&str> = Pieces::new(&text, Some(&fast), &full)
+                .map(|p| p.unwrap())
+                .collect();
+            assert_eq!(expected, actual, "pieces differ for {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_fast_split_matches_r50k() {
+        assert_same_pieces(R50K_PATTERN);
+    }
+
+    #[test]
+    fn test_fast_split_matches_cl100k() {
+        assert_same_pieces(CL100K_PATTERN);
+    }
+
+    #[test]
+    fn test_fast_split_refuses_unsupported_patterns() {
+        // Nothing to gain: the whole pattern is already automaton-friendly, so
+        // `fancy_regex` never enters its VM for it.
+        assert!(fast_split::derive(r"[a-z]+|[0-9]+").is_none());
+        // A look-around in the very first alternative leaves no usable prefix.
+        assert!(fast_split::derive(r"\s+(?!\S)|\s").is_none());
+        // Unbalanced patterns are refused rather than mis-parsed.
+        assert!(fast_split::derive(r"(a|b").is_none());
+    }
+
+    #[test]
+    fn test_fast_split_handles_non_ascii_patterns() {
+        // Non-ASCII characters in the pattern must survive the possessive-marker
+        // rewrite untouched.
+        let pattern = r"é++|中\é|\s+(?!\S)|\s";
+        let full = Regex::new(pattern).unwrap();
+        let fast = fast_split::derive(pattern).expect("has a usable prefix");
+        for text in ["ééé 中é", "中\u{e9}", "  x", "é"] {
+            let expected: Vec<&str> = full.find_iter(text).map(|m| m.unwrap().as_str()).collect();
+            let actual: Vec<&str> = Pieces::new(text, Some(&fast), &full)
+                .map(|p| p.unwrap())
+                .collect();
+            assert_eq!(expected, actual, "pieces differ for {text:?}");
+        }
+    }
 
     fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
         HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
