@@ -195,6 +195,187 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
     parts
 }
 
+/// Number of bits a rank occupies inside a [`MergeRanks`] slot.
+///
+/// A slot packs the two operand ranks and the merged rank, so ranks must fit in
+/// a third of a `u64`. Every encoding tiktoken ships is far below this bound
+/// (`cl100k_base` tops out at ~100k, `o200k_base` at ~200k); a vocabulary that
+/// is not simply keeps the byte-slice lookup path.
+const MERGE_RANK_BITS: u32 = 20;
+const MERGE_RANK_LIMIT: Rank = 1 << MERGE_RANK_BITS;
+const MERGE_RANK_MASK: u64 = (MERGE_RANK_LIMIT - 1) as u64;
+/// Empty marker: a real slot is at most 60 bits wide, so `u64::MAX` is free.
+const MERGE_EMPTY: u64 = u64::MAX;
+/// Fibonacci hashing multiplier.
+const MERGE_HASH_MULT: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Maps a pair of adjacent token ranks to the rank of their concatenation.
+///
+/// The byte-pair merge loop only ever looks up the concatenation of two
+/// *tokens*: it starts from single bytes (which are tokens in a byte-level
+/// vocabulary) and every merge replaces two tokens by the token they form. Rank
+/// and bytes determine each other, so keying those lookups on the pair of ranks
+/// is equivalent to keying them on the concatenated bytes — and much cheaper:
+/// hashing one `u64` instead of a byte slice, and comparing the key inline
+/// instead of chasing the `Vec<u8>` key of the vocabulary map into the heap and
+/// calling `memcmp`. It also means a merged part already knows its own rank, so
+/// emitting the token list needs no lookups at all.
+struct MergeRanks {
+    /// Open-addressed (linear probing) table. Each slot packs
+    /// `left << 2*BITS | right << BITS | merged`, or [`MERGE_EMPTY`].
+    slots: Vec<u64>,
+    mask: usize,
+    shift: u32,
+    /// Rank of each single-byte token, the starting point of every merge.
+    byte_ranks: [Rank; 256],
+}
+
+impl MergeRanks {
+    /// Builds the table, or returns `None` when the vocabulary does not fit the
+    /// assumptions above (some single byte is not a token, or a rank is too
+    /// large to pack), in which case callers keep the byte-slice path.
+    fn new(encoder: &HashMap<Vec<u8>, Rank>) -> Option<MergeRanks> {
+        let mut byte_ranks = [Rank::MAX; 256];
+        for (b, slot) in byte_ranks.iter_mut().enumerate() {
+            *slot = *encoder.get(&[b as u8][..])?;
+        }
+        if encoder.values().any(|&rank| rank >= MERGE_RANK_LIMIT) {
+            return None;
+        }
+
+        // Every (left, right) token pair whose concatenation is itself a token.
+        let pairs = encoder
+            .iter()
+            .flat_map(|(token, &merged)| {
+                (1..token.len()).filter_map(move |i| {
+                    let left = *encoder.get(&token[..i])?;
+                    let right = *encoder.get(&token[i..])?;
+                    Some((left, right, merged))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // Keep the load factor at or below 1/2 so probe chains stay short.
+        let capacity = (2 * pairs.len().max(1)).next_power_of_two();
+        let mut table = MergeRanks {
+            slots: vec![MERGE_EMPTY; capacity],
+            mask: capacity - 1,
+            shift: u64::BITS - capacity.trailing_zeros(),
+            byte_ranks,
+        };
+        for (left, right, merged) in pairs {
+            let key = Self::key(left, right);
+            let mut idx = table.probe(key);
+            while table.slots[idx] != MERGE_EMPTY {
+                if table.slots[idx] >> MERGE_RANK_BITS == key {
+                    break;
+                }
+                idx = (idx + 1) & table.mask;
+            }
+            table.slots[idx] = (key << MERGE_RANK_BITS) | merged as u64;
+        }
+        Some(table)
+    }
+
+    #[inline(always)]
+    fn key(left: Rank, right: Rank) -> u64 {
+        ((left as u64) << MERGE_RANK_BITS) | right as u64
+    }
+
+    #[inline(always)]
+    fn probe(&self, key: u64) -> usize {
+        (key.wrapping_mul(MERGE_HASH_MULT) >> self.shift) as usize & self.mask
+    }
+
+    /// Rank of the token formed by concatenating the tokens `left` and `right`,
+    /// or `Rank::MAX` if that concatenation is not a token.
+    #[inline(always)]
+    fn get(&self, left: Rank, right: Rank) -> Rank {
+        let key = Self::key(left, right);
+        let mut idx = self.probe(key);
+        loop {
+            let slot = self.slots[idx];
+            if slot >> MERGE_RANK_BITS == key {
+                return (slot & MERGE_RANK_MASK) as Rank;
+            }
+            if slot == MERGE_EMPTY {
+                return Rank::MAX;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    /// Byte-pair encodes `piece`, resolving every merge through the rank table.
+    ///
+    /// Produces exactly the same tokens as [`byte_pair_encode`]; only the way
+    /// the vocabulary is consulted differs.
+    fn byte_pair_encode(&self, piece: &[u8]) -> Vec<Rank> {
+        debug_assert!(piece.len() > 1);
+        // `rank` is the rank of the part's own token, `pair` the rank of the
+        // token this part and the next one would merge into.
+        #[derive(Clone, Copy)]
+        struct Part {
+            rank: Rank,
+            pair: Rank,
+        }
+
+        let len = piece.len();
+        let mut parts: Vec<Part> = Vec::with_capacity(len + 1);
+        let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
+        let mut rank = self.byte_ranks[piece[0] as usize];
+        for i in 0..len - 1 {
+            let next = self.byte_ranks[piece[i + 1] as usize];
+            let pair = self.get(rank, next);
+            if pair < min_rank.0 {
+                min_rank = (pair, i);
+            }
+            parts.push(Part { rank, pair });
+            rank = next;
+        }
+        parts.push(Part {
+            rank,
+            pair: Rank::MAX,
+        });
+        // Trailing sentinel, mirroring the byte-slice implementation: it marks
+        // the end of the piece and is never emitted.
+        parts.push(Part {
+            rank: Rank::MAX,
+            pair: Rank::MAX,
+        });
+
+        while min_rank.0 != Rank::MAX {
+            let i = min_rank.1;
+            let merged = min_rank.0;
+            // Update parts[i] and parts[i - 1] before removing parts[i + 1],
+            // since `parts.remove(i + 1)` will thrash the cache.
+            parts[i].rank = merged;
+            parts[i].pair = if i + 3 < parts.len() {
+                self.get(merged, parts[i + 2].rank)
+            } else {
+                Rank::MAX
+            };
+            if i > 0 {
+                parts[i - 1].pair = if i + 2 < parts.len() {
+                    self.get(parts[i - 1].rank, merged)
+                } else {
+                    Rank::MAX
+                };
+            }
+            parts.remove(i + 1);
+
+            min_rank = (Rank::MAX, usize::MAX);
+            for (i, part) in parts[..parts.len() - 1].iter().enumerate() {
+                if part.pair < min_rank.0 {
+                    min_rank = (part.pair, i);
+                }
+            }
+        }
+
+        // Every part carries the rank of its own token, so no lookup is needed.
+        parts[..parts.len() - 1].iter().map(|p| p.rank).collect()
+    }
+}
+
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
     let piece_len = piece.len();
 
@@ -329,6 +510,10 @@ pub struct CoreBPE {
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
+    // Rank-keyed view of the vocabulary used by the byte-pair merge loop. See
+    // `MergeRanks`. `None` for vocabularies that do not fit its assumptions, in
+    // which case the merge loop keeps looking tokens up by their bytes.
+    merge_ranks: Option<std::sync::Arc<MergeRanks>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
@@ -363,6 +548,21 @@ impl CoreBPE {
         }
     }
 
+    /// Byte-pair encodes a regex piece that is not itself a token.
+    ///
+    /// Prefers the rank-keyed merge table, which resolves each merge with a
+    /// single `u64` probe instead of hashing a byte slice and comparing it
+    /// against a heap-allocated vocabulary key.
+    #[inline]
+    fn encode_piece(&self, piece: &[u8]) -> Vec<Rank> {
+        if let Some(merge_ranks) = &self.merge_ranks
+            && (2..100).contains(&piece.len())
+        {
+            return merge_ranks.byte_pair_encode(piece);
+        }
+        byte_pair_encode(piece, &self.encoder)
+    }
+
     /// Decodes tokens into a list of bytes.
     ///
     /// The bytes are not gauranteed to be a valid utf-8 string.
@@ -384,7 +584,7 @@ impl CoreBPE {
             let piece = mat.unwrap().as_str().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+                None => ret.extend(&self.encode_piece(piece)),
             }
         }
         ret
@@ -436,7 +636,7 @@ impl CoreBPE {
                     ret.push(*token);
                     continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
+                let tokens = self.encode_piece(piece);
                 last_piece_token_len = tokens.len();
                 ret.extend(&tokens);
             }
@@ -679,6 +879,9 @@ impl CoreBPE {
             None => Vec::new(),
         };
 
+        // Rank-keyed merge table for the byte-pair merge loop (see `MergeRanks`).
+        let merge_ranks = MergeRanks::new(&encoder).map(std::sync::Arc::new);
+
         // Clone because I don't know how to tell Rust I'm not going to change the map
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
@@ -701,6 +904,7 @@ impl CoreBPE {
             decoder,
             special_tokens_decoder,
             decoder_flat,
+            merge_ranks,
             regex_tls,
             special_regex_tls,
             sorted_token_bytes,
@@ -743,5 +947,67 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    /// The rank-keyed merge table must produce exactly the tokens the
+    /// byte-slice merge loop produces.
+    #[test]
+    fn test_merge_ranks_matches_byte_pair_encode() {
+        use crate::{Rank, byte_pair_encode};
+        use rustc_hash::FxHashMap as HashMap;
+
+        // A small byte-level vocabulary: every single byte, plus every pair and
+        // triple built from a handful of letters, so that merges really happen.
+        let mut ranks: HashMap<Vec<u8>, Rank> = HashMap::default();
+        let mut next: Rank = 0;
+        for b in 0..=255u8 {
+            ranks.insert(vec![b], next);
+            next += 1;
+        }
+        let alphabet = b"abcd ";
+        for &x in alphabet {
+            for &y in alphabet {
+                ranks.insert(vec![x, y], next);
+                next += 1;
+            }
+        }
+        for &x in alphabet {
+            for &y in alphabet {
+                for &z in alphabet {
+                    ranks.insert(vec![x, y, z], next);
+                    next += 1;
+                }
+            }
+        }
+
+        let table = super::MergeRanks::new(&ranks).expect("table should build");
+
+        // Deterministic pseudo-random pieces over the alphabet plus bytes that
+        // only ever appear as single-byte tokens.
+        let letters = b"abcd exyz";
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for len in 2..12usize {
+            for _ in 0..500 {
+                let piece: Vec<u8> = (0..len)
+                    .map(|_| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        letters[(state >> 33) as usize % letters.len()]
+                    })
+                    .collect();
+                assert_eq!(
+                    table.byte_pair_encode(&piece),
+                    byte_pair_encode(&piece, &ranks),
+                    "mismatch for piece {piece:?}"
+                );
+            }
+        }
+    }
+
+    /// Vocabularies the table cannot represent must be rejected so callers keep
+    /// the byte-slice path.
+    #[test]
+    fn test_merge_ranks_rejects_unsupported_vocab() {
+        // `setup_ranks` has no single-byte tokens at all.
+        assert!(super::MergeRanks::new(&setup_ranks()).is_none());
     }
 }
