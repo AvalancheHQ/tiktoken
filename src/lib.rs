@@ -315,6 +315,177 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+// Tokeniser split patterns are one big ordered alternation. `fancy_regex` compiles
+// every top-level alternative into its own branch of its backtracking VM: each one
+// costs a `Split` (a backtrack-stack push), and every quantified piece inside it
+// costs a separate anchored `regex-automata` search, plus atomic-group bookkeeping
+// when the quantifier is possessive. Profiles of `encode_ordinary` put ~86% of the
+// run inside that VM.
+//
+// A run of consecutive alternatives that `regex-automata` can handle on its own can
+// instead be handed to it *as a single automaton*: nesting them in a group turns the
+// run into one sub-expression, which `fancy_regex` compiles to a single `Delegate`
+// instruction. The VM then does one delegated search per piece instead of one per
+// alternative-and-atom, while the automaton resolves the alternation internally with
+// the same leftmost-first (ordered) semantics the VM's branch order gives.
+//
+// `(?:A|B|C)|D` matches exactly what `A|B|C|D` matches — a non-capturing group only
+// changes how the pattern is parsed, not what it accepts.
+//
+// Possessive quantifiers, however, force the VM (they compile to atomic groups), so
+// a run containing them is only merged once the possessive markers can be dropped.
+// That is not decidable syntactically in general, so the two patterns tiktoken ships
+// are recognised verbatim and paired with a hand-checked greedy equivalent below.
+// Every other pattern only gets the (always-sound) regrouping, and anything that
+// does not fit falls back to the pattern exactly as written.
+mod split_pattern {
+    /// Split patterns whose possessive quantifiers are provably redundant, paired
+    /// with the equivalent greedy form. Each `X?+ Y++` / `X++ Y*+` pair below has
+    /// disjoint character sets (`[^\r\n\p{L}\p{N}]` excludes letters, ` ` and
+    /// `[\r\n]` are `\s` which `[^\s\p{L}\p{N}]` excludes), and nothing follows the
+    /// last quantifier of an alternative, so a greedy quantifier can never give
+    /// back a character that would let the rest of the alternative match. Dropping
+    /// the markers therefore changes nothing about which pieces are produced; it
+    /// only lets the alternatives be delegated to an automaton.
+    ///
+    /// The differential test `split_pattern_rewrites_are_equivalent` checks this.
+    const GREEDY_EQUIVALENTS: &[(&str, &str)] = &[
+        // r50k_base / gpt2 / p50k_base
+        (
+            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s",
+            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s++$|\s+(?!\S)|\s",
+        ),
+        // cl100k_base
+        (
+            r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s",
+            r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s++$|\s*[\r\n]|\s+(?!\S)|\s",
+        ),
+    ];
+
+    /// Splits `pattern` at its top-level `|`, ignoring `|` inside escapes,
+    /// character classes and groups. Returns `None` if the pattern is not
+    /// well balanced (which the regex compiler will reject anyway).
+    fn top_level_alternatives(pattern: &str) -> Option<Vec<&str>> {
+        let bytes = pattern.as_bytes();
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let mut depth = 0usize;
+        let mut in_class = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                b'[' if !in_class => in_class = true,
+                b']' if in_class => in_class = false,
+                b'(' if !in_class => depth += 1,
+                b')' if !in_class => depth = depth.checked_sub(1)?,
+                b'|' if !in_class && depth == 0 => {
+                    parts.push(&pattern[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if in_class || depth != 0 {
+            return None;
+        }
+        parts.push(&pattern[start..]);
+        Some(parts)
+    }
+
+    /// Whether an alternative can be handled by `regex-automata` on its own, i.e.
+    /// it uses no construct that forces `fancy_regex`'s backtracking VM.
+    fn is_delegatable(alt: &str) -> bool {
+        if alt.is_empty() {
+            return false;
+        }
+        let bytes = alt.as_bytes();
+        let mut i = 0;
+        let mut in_class = false;
+        let mut prev_quantifier_end = usize::MAX;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => {
+                    let Some(&next) = bytes.get(i + 1) else {
+                        return false;
+                    };
+                    // Backreferences, \G and \K are all VM-only constructs.
+                    if next.is_ascii_digit() || next == b'G' || next == b'K' {
+                        return false;
+                    }
+                    i += 1;
+                    // Skip the payload of braced escapes such as `\p{L}` or
+                    // `\x{1F600}`, so their closing brace is not mistaken for
+                    // the end of a `{n,m}` quantifier.
+                    if bytes.get(i + 1) == Some(&b'{') {
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'}' {
+                            i += 1;
+                        }
+                        if i == bytes.len() {
+                            return false;
+                        }
+                    }
+                }
+                b'[' if !in_class => in_class = true,
+                b']' if in_class => in_class = false,
+                b'(' if !in_class => {
+                    // Only non-capturing groups: capturing groups would be
+                    // renumbered by the wrapping group, and lookaround/atomic
+                    // groups are exactly what we must not swallow.
+                    if bytes.get(i + 1) != Some(&b'?') {
+                        return false;
+                    }
+                    match bytes.get(i + 2) {
+                        // (?: and inline flags such as (?i: are fine.
+                        Some(b':') => {}
+                        Some(c) if c.is_ascii_alphabetic() || *c == b'-' => {}
+                        _ => return false,
+                    }
+                }
+                // A `+` directly after a quantifier is a possessive marker, which
+                // compiles to an atomic group and forces the VM.
+                b'+' if !in_class && i == prev_quantifier_end => return false,
+                b'?' | b'*' | b'+' | b'}' if !in_class => prev_quantifier_end = i + 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Rewrites a tokeniser split pattern into an equivalent one that
+    /// `fancy_regex` can delegate to a single automaton for its leading
+    /// alternatives. Returns `None` when no worthwhile rewrite applies.
+    pub(crate) fn regroup(pattern: &str) -> Option<String> {
+        let pattern = GREEDY_EQUIVALENTS
+            .iter()
+            .find(|(possessive, _)| *possessive == pattern)
+            .map_or(pattern, |(_, greedy)| *greedy);
+
+        let alternatives = top_level_alternatives(pattern)?;
+        let merged = alternatives
+            .iter()
+            .take_while(|alt| is_delegatable(alt))
+            .count();
+        // Merging is only a win when it removes VM branches.
+        if merged < 2 {
+            return None;
+        }
+        let head = alternatives[..merged].join("|");
+        let mut out = String::with_capacity(pattern.len() + 4);
+        out.push_str("(?:");
+        out.push_str(&head);
+        out.push(')');
+        for alt in &alternatives[merged..] {
+            out.push('|');
+            out.push_str(alt);
+        }
+        Some(out)
+    }
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -688,8 +859,19 @@ impl CoreBPE {
         // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
         // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
         // lock-free path), paying the compile cost once at construction rather than on the hot path.
+        //
+        // The slots are built from the regrouped form of the pattern (see the `split_pattern`
+        // module), which is equivalent but lets `regex-automata` resolve the common alternatives
+        // in one automaton. Compiling the pattern as written first keeps invalid patterns
+        // rejected, so a rewrite can never make a pattern the compiler would refuse acceptable.
+        let split_pattern = match split_pattern::regroup(pattern) {
+            Some(rewritten) if Regex::new(pattern).is_ok() && Regex::new(&rewritten).is_ok() => {
+                rewritten
+            }
+            _ => pattern.to_string(),
+        };
         let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
+            .map(|_| Regex::new(&split_pattern))
             .collect::<Result<Vec<_>, _>>()?;
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
@@ -743,5 +925,84 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PAT: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K_PAT: &str = concat!(
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|",
+        r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+    );
+
+    fn pieces<'t>(pattern: &str, text: &'t str) -> Vec<&'t str> {
+        let re = Regex::new(pattern).unwrap();
+        re.find_iter(text).map(|m| m.unwrap().as_str()).collect()
+    }
+
+    /// The rewritten split pattern must produce exactly the same piece stream as
+    /// the pattern as written, for every pattern tiktoken ships.
+    #[test]
+    fn split_pattern_rewrites_are_equivalent() {
+        let texts = [
+            "",
+            " ",
+            "  ",
+            "   \n  \n",
+            "\n",
+            "\r\n\r\n",
+            "hello world",
+            "The quick brown fox jumps over the lazy dog.",
+            "it's a dog's life, isn't it? IT'S -- 'twas",
+            "'s't're've'm'll'd'S'T'RE",
+            "'",
+            "''",
+            "1 12 123 1234 12345 007",
+            "a1b2c3 42abc",
+            "  leading and trailing   ",
+            "punctuation!!!???...,,,;;;",
+            "tabs\tand\x0bform\x0cfeeds",
+            "emoji 👍🏽 and ZWJ 👨‍👩‍👧‍👦 done",
+            "naïve café résumé Ångström",
+            "日本語のテキストです。",
+            "combining a\u{0301}e\u{0301} marks",
+            "nbsp\u{00a0}and\u{2003}em space",
+            "Ⅷ roman ٣٤٥ arabic-indic",
+            "mixed  CASE Words And   Numbers 123\n\n\ttrailing\n",
+            "a\u{0085}b\u{2028}c\u{2029}d",
+            "trailing whitespace   ",
+            "trailing newline\n",
+            "\u{feff}bom",
+            "-'-'-",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        ];
+        for pattern in [R50K_PAT, CL100K_PAT, O200K_PAT] {
+            let rewritten = super::split_pattern::regroup(pattern)
+                .expect("shipped patterns should be regrouped");
+            assert_ne!(rewritten, pattern);
+            for text in texts {
+                assert_eq!(
+                    pieces(pattern, text),
+                    pieces(&rewritten, text),
+                    "piece streams diverged for {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_pattern_regroup_refuses_unsafe_patterns() {
+        // A leading capturing group would be renumbered by the wrapper.
+        assert!(super::split_pattern::regroup(r"(a)|b|c").is_none());
+        // Lookaround and back-references must stay in the backtracking VM.
+        assert!(super::split_pattern::regroup(r"a(?=b)|b|c").is_none());
+        assert!(super::split_pattern::regroup(r"(?:a)\1|b|c").is_none());
+        // Possessive quantifiers in an unknown pattern are left alone.
+        assert!(super::split_pattern::regroup(r"a++|b|c").is_none());
+        // Nothing to merge.
+        assert!(super::split_pattern::regroup(r"abc").is_none());
+        // Unbalanced patterns are refused outright.
+        assert!(super::split_pattern::regroup(r"(a|b").is_none());
     }
 }
