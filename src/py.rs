@@ -4,7 +4,7 @@ use pyo3::{
     IntoPyObjectExt, PyResult, exceptions,
     prelude::*,
     pybacked::PyBackedStr,
-    types::{PyBytes, PyList},
+    types::{PyBytes, PyFrozenSet, PyList, PySet},
 };
 use rustc_hash::FxHashMap as HashMap;
 
@@ -36,8 +36,9 @@ impl CoreBPE {
         &self,
         py: Python,
         text: &str,
-        allowed_special: HashSet<PyBackedStr>,
+        allowed_special: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<Rank>> {
+        let allowed_special = extract_allowed_special(allowed_special)?;
         py.detach(|| {
             let allowed_special: HashSet<&str> =
                 allowed_special.iter().map(|s| s.as_ref()).collect();
@@ -52,8 +53,9 @@ impl CoreBPE {
         &self,
         py: Python,
         text: &str,
-        allowed_special: HashSet<PyBackedStr>,
+        allowed_special: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
+        let allowed_special = extract_allowed_special(allowed_special)?;
         let tokens_res = py.detach(|| {
             let allowed_special: HashSet<&str> =
                 allowed_special.iter().map(|s| s.as_ref()).collect();
@@ -119,8 +121,9 @@ impl CoreBPE {
         &self,
         py: Python,
         text: &str,
-        allowed_special: HashSet<PyBackedStr>,
+        allowed_special: &Bound<'_, PyAny>,
     ) -> PyResult<(Vec<Rank>, Py<PyList>)> {
+        let allowed_special = extract_allowed_special(allowed_special)?;
         let (tokens, completions): (Vec<Rank>, HashSet<Vec<Rank>>) = py.detach(|| {
             let allowed_special: HashSet<&str> =
                 allowed_special.iter().map(|s| s.as_ref()).collect();
@@ -219,6 +222,28 @@ impl CoreBPE {
             .map(|x| PyBytes::new(py, x).into())
             .collect()
     }
+}
+
+/// Materialises the `allowed_special` argument of the `encode` family.
+///
+/// `Encoding.encode` & friends pass an empty set on by far the most common path
+/// (nothing is allowed to be encoded as a special token), yet PyO3's generic
+/// set extraction still allocates a Python iterator object, queries its length
+/// hint and walks it before handing back an empty `HashSet`. That is a fixed
+/// per-call cost paid regardless of the input size, so an empty `set`/
+/// `frozenset` short-circuits to the very same empty value here. Every other
+/// input keeps the generic extraction, and with it the original error types
+/// (taking the argument as a `Bound` does mean pyo3 no longer prefixes those
+/// errors with `argument 'allowed_special':`).
+fn extract_allowed_special(obj: &Bound<'_, PyAny>) -> PyResult<HashSet<PyBackedStr>> {
+    let empty = match obj.downcast::<PySet>() {
+        Ok(set) => set.is_empty(),
+        Err(_) => matches!(obj.downcast::<PyFrozenSet>(), Ok(set) if set.is_empty()),
+    };
+    if empty {
+        return Ok(HashSet::new());
+    }
+    obj.extract()
 }
 
 /// Read a token id from a Python object, reading a plain in-range `int` with a
