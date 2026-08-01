@@ -259,6 +259,291 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
+/// The leading alternatives of a tokeniser split pattern that can only ever
+/// match at one specific literal byte (e.g. cl100k's `'(?i:[sdmt]|ll|ve|re)`,
+/// which requires an apostrophe).
+///
+/// `fancy_regex` runs the split on its backtracking VM, and the VM tries every
+/// alternative in order at every piece start. Those leading alternatives
+/// therefore cost a delegate automaton call per piece even though the byte at
+/// the piece start already rules them out. Keeping them in a separate regex
+/// lets the hot path run the remaining alternatives only, and consult this one
+/// just at the positions where it can actually match.
+#[derive(Clone)]
+struct LiteralPrefixAlts {
+    /// The literal bytes those alternatives must start with.
+    guards: Vec<u8>,
+    /// One compiled copy per thread-local slot, see `regex_tls`.
+    regex_tls: Vec<Regex>,
+}
+
+/// Splits `pattern` into its top-level alternatives, i.e. the `|`-separated
+/// branches that are not inside a group or a character class.
+fn top_level_alternatives(pattern: &str) -> Option<Vec<&str>> {
+    let bytes = pattern.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth: i32 = 0;
+    let mut in_class = false;
+    let mut class_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    return None;
+                }
+                i += 2;
+                continue;
+            }
+            b'[' if !in_class => {
+                in_class = true;
+                class_start = i;
+            }
+            b']' if in_class => {
+                // A `]` right after `[` or `[^` is a literal, not the class end.
+                let literal = i == class_start + 1
+                    || (i == class_start + 2 && bytes[class_start + 1] == b'^');
+                if !literal {
+                    in_class = false;
+                }
+            }
+            b'(' if !in_class => depth += 1,
+            b')' if !in_class => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            b'|' if !in_class && depth == 0 => {
+                parts.push(&pattern[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth != 0 || in_class {
+        return None;
+    }
+    parts.push(&pattern[start..]);
+    Some(parts)
+}
+
+/// The byte an alternative must start with, if it always starts with the same
+/// plain literal one.
+///
+/// Only non-alphanumeric ASCII literals are accepted, so a case-insensitivity
+/// flag elsewhere in the pattern cannot make the alternative match a different
+/// byte, and the byte can be compared directly against UTF-8 input.
+fn mandatory_literal_prefix(alt: &str) -> Option<u8> {
+    let bytes = alt.as_bytes();
+    let first = *bytes.first()?;
+    if !first.is_ascii()
+        || first.is_ascii_alphanumeric()
+        || first.is_ascii_whitespace()
+        || first.is_ascii_control()
+        || b"\\^$.[]()*+?{}|".contains(&first)
+    {
+        return None;
+    }
+    // The literal must be mandatory: a quantifier that allows zero repetitions
+    // would let the alternative match at a different byte.
+    match bytes.get(1) {
+        Some(b'?') | Some(b'*') | Some(b'{') => None,
+        _ => Some(first),
+    }
+}
+
+/// Whether an alternative can be lifted out of the pattern verbatim: it must
+/// not open a capture group (which would renumber the groups of the
+/// alternatives that stay behind) nor set flags that would leak into them.
+fn alternative_is_self_contained(alt: &str) -> bool {
+    let bytes = alt.as_bytes();
+    let mut in_class = false;
+    let mut class_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    return false;
+                }
+                i += 2;
+                continue;
+            }
+            b'[' if !in_class => {
+                in_class = true;
+                class_start = i;
+            }
+            b']' if in_class => {
+                let literal = i == class_start + 1
+                    || (i == class_start + 2 && bytes[class_start + 1] == b'^');
+                if !literal {
+                    in_class = false;
+                }
+            }
+            b'(' if !in_class => {
+                if bytes.get(i + 1) != Some(&b'?') {
+                    return false; // capture group
+                }
+                // Accept only `(?flags:` groups: anything reaching `)` first is
+                // a flag setter or a lookaround, which we do not reason about.
+                let mut j = i + 2;
+                while j < bytes.len() && bytes[j] != b':' && bytes[j] != b')' {
+                    j += 1;
+                }
+                if j >= bytes.len() || bytes[j] == b')' {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Peels the leading alternatives of a split pattern that can only match at a
+/// fixed literal byte.
+///
+/// Returns `(peeled_pattern, remaining_pattern, guard_bytes)`. Because
+/// alternation is ordered, an alternative that cannot match at a position never
+/// influences the match there, so running `remaining_pattern` alone at
+/// positions whose byte is not a guard yields exactly the same pieces.
+fn peel_literal_prefix_alternatives(pattern: &str) -> Option<(String, String, Vec<u8>)> {
+    // `\G`/`\K` depend on where the search started and backreferences depend on
+    // group numbering; both would be affected by splitting the pattern.
+    if pattern.contains("\\G") || pattern.contains("\\K") || pattern.contains("\\k") {
+        return None;
+    }
+    if pattern
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'\\' && w[1].is_ascii_digit())
+    {
+        return None;
+    }
+
+    let alts = top_level_alternatives(pattern)?;
+    let mut guards: Vec<u8> = Vec::new();
+    let mut peeled = 0usize;
+    for alt in &alts {
+        match mandatory_literal_prefix(alt) {
+            Some(byte) if alternative_is_self_contained(alt) => {
+                if !guards.contains(&byte) {
+                    guards.push(byte);
+                }
+                peeled += 1;
+            }
+            _ => break,
+        }
+    }
+    if peeled == 0 || peeled == alts.len() {
+        return None;
+    }
+    Some((alts[..peeled].join("|"), alts[peeled..].join("|"), guards))
+}
+
+/// Iterates over the tokeniser split pieces of `text`, mirroring
+/// `fancy_regex::Regex::find_iter` while skipping the alternatives that cannot
+/// match at the current position.
+struct Pieces<'t, 'c> {
+    text: &'t str,
+    regex: &'c Regex,
+    prefix: Option<(&'c [u8], &'c Regex)>,
+    last_end: usize,
+    last_match: Option<usize>,
+}
+
+impl<'t> Pieces<'t, '_> {
+    /// Position of the next byte in `bytes[from..to]` that one of the peeled
+    /// alternatives could start at.
+    #[inline]
+    fn next_guard(bytes: &[u8], from: usize, to: usize, guards: &[u8]) -> Option<usize> {
+        let to = to.min(bytes.len());
+        if from >= to {
+            return None;
+        }
+        bytes[from..to]
+            .iter()
+            .position(|b| guards.contains(b))
+            .map(|i| from + i)
+    }
+
+    fn find_from(&self, from: usize) -> fancy_regex::Result<Option<(usize, usize)>> {
+        let Some((guards, prefix_regex)) = self.prefix else {
+            return Ok(self
+                .regex
+                .find_from_pos(self.text, from)?
+                .map(|m| (m.start(), m.end())));
+        };
+
+        let bytes = self.text.as_bytes();
+        let mut pos = from;
+        loop {
+            // The peeled alternatives come first in the pattern, so they win at
+            // any position where they match.
+            if bytes.get(pos).is_some_and(|b| guards.contains(b))
+                && let Some(m) = prefix_regex.find_from_pos(self.text, pos)?
+                && m.start() == pos
+            {
+                return Ok(Some((m.start(), m.end())));
+            }
+            match self.regex.find_from_pos(self.text, pos)? {
+                // No match at or after `pos` for the remaining alternatives, but
+                // a peeled one may still match at a later guard byte.
+                None => match Self::next_guard(bytes, pos + 1, bytes.len(), guards) {
+                    Some(next) => pos = next,
+                    None => return Ok(None),
+                },
+                Some(m) => {
+                    // A peeled alternative starting anywhere up to and including
+                    // the match start would have matched earlier (or won there).
+                    match Self::next_guard(bytes, pos + 1, m.start() + 1, guards) {
+                        Some(next) => pos = next,
+                        None => return Ok(Some((m.start(), m.end()))),
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<'t> Iterator for Pieces<'t, '_> {
+    type Item = fancy_regex::Result<&'t str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.last_end > self.text.len() {
+                return None;
+            }
+            let (start, end) = match self.find_from(self.last_end) {
+                Ok(Some(m)) => m,
+                Ok(None) => return None,
+                Err(error) => {
+                    // Stop on the first error, like `fancy_regex::Matches`.
+                    self.last_end = self.text.len() + 1;
+                    return Some(Err(error));
+                }
+            };
+
+            if start == end {
+                // Empty match: make progress, and skip one that immediately
+                // follows the previous match.
+                self.last_end = end + self.text[end..].chars().next().map_or(1, char::len_utf8);
+                if Some(end) == self.last_match {
+                    continue;
+                }
+            } else {
+                self.last_end = end;
+            }
+            self.last_match = Some(end);
+            return Some(Ok(&self.text[start..end]));
+        }
+    }
+}
+
 struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -329,7 +614,10 @@ pub struct CoreBPE {
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
+    // Holds the split pattern minus the alternatives peeled into
+    // `prefix_alts` (the pattern verbatim when nothing was peeled).
     regex_tls: Vec<Regex>,
+    prefix_alts: Option<LiteralPrefixAlts>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
@@ -340,6 +628,22 @@ impl CoreBPE {
         // It's also a little janky, please make a better version of it!
         // However, it's nice that this doesn't leak memory to short-lived threads
         &self.regex_tls[hash_current_thread() % MAX_NUM_THREADS]
+    }
+
+    /// Iterates over the tokeniser split pieces of `text`, exactly as
+    /// `self._get_tl_regex().find_iter(text)` would.
+    fn _split_pieces<'t>(&self, text: &'t str) -> Pieces<'t, '_> {
+        let slot = hash_current_thread() % MAX_NUM_THREADS;
+        Pieces {
+            text,
+            regex: &self.regex_tls[slot],
+            prefix: self
+                .prefix_alts
+                .as_ref()
+                .map(|alts| (alts.guards.as_slice(), &alts.regex_tls[slot])),
+            last_end: 0,
+            last_match: None,
+        }
     }
 
     fn _get_tl_special_regex(&self) -> &Regex {
@@ -378,10 +682,9 @@ impl CoreBPE {
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        for mat in self._split_pieces(text) {
+            let piece = mat.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -396,7 +699,6 @@ impl CoreBPE {
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
 
         let mut start = 0;
@@ -420,7 +722,7 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
+            for mat_res in self._split_pieces(&text[start..end]) {
                 let mat = match mat_res {
                     Ok(m) => m,
                     Err(e) => {
@@ -430,7 +732,7 @@ impl CoreBPE {
                     }
                 };
 
-                let piece = mat.as_str().as_bytes();
+                let piece = mat.as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
                     ret.push(*token);
@@ -688,9 +990,44 @@ impl CoreBPE {
         // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
         // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
         // lock-free path), paying the compile cost once at construction rather than on the hot path.
-        let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
-            .collect::<Result<Vec<_>, _>>()?;
+        // The leading alternatives that can only match at a fixed literal byte
+        // are compiled separately, so the hot path does not ask the backtracking
+        // VM about them at every piece start. Anything that cannot be peeled
+        // (including any pattern we do not fully understand) keeps the pattern
+        // verbatim, and a peeled pattern that fails to compile falls back too.
+        let peeled =
+            peel_literal_prefix_alternatives(pattern).and_then(|(prefix, rest, guards)| {
+                let rest_tls = (0..MAX_NUM_THREADS)
+                    .map(|_| Regex::new(&rest))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                let prefix_tls = (0..MAX_NUM_THREADS)
+                    .map(|_| Regex::new(&prefix))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                Some((
+                    rest_tls,
+                    LiteralPrefixAlts {
+                        guards,
+                        regex_tls: prefix_tls,
+                    },
+                ))
+            });
+
+        let (regex_tls, prefix_alts) = match peeled {
+            Some((rest_tls, alts)) => {
+                // Compile the pattern as written once, so an invalid pattern is
+                // still rejected here exactly as before.
+                Regex::new(pattern)?;
+                (rest_tls, Some(alts))
+            }
+            None => (
+                (0..MAX_NUM_THREADS)
+                    .map(|_| Regex::new(pattern))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None,
+            ),
+        };
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
             .collect::<Result<Vec<_>, _>>()?;
@@ -702,6 +1039,7 @@ impl CoreBPE {
             special_tokens_decoder,
             decoder_flat,
             regex_tls,
+            prefix_alts,
             special_regex_tls,
             sorted_token_bytes,
         })
@@ -743,5 +1081,76 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PAT: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K_PAT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// The split must yield exactly what `fancy_regex::find_iter` yields.
+    fn assert_same_pieces(pattern: &str, texts: &[&str]) {
+        let bpe = crate::CoreBPE::new_internal(
+            HashMap::from_iter([(b"a".to_vec(), 0)]),
+            HashMap::default(),
+            pattern,
+        )
+        .unwrap();
+        let reference = Regex::new(pattern).unwrap();
+        for text in texts {
+            let expected: Vec<&str> = reference
+                .find_iter(text)
+                .map(|m| m.unwrap().as_str())
+                .collect();
+            let actual: Vec<&str> = bpe._split_pieces(text).map(|p| p.unwrap()).collect();
+            assert_eq!(actual, expected, "pattern {pattern:?} on text {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_split_matches_fancy_regex() {
+        let texts = [
+            "",
+            "'",
+            "'s",
+            "'S",
+            "don't stop",
+            "it's a 'quoted' word",
+            "hello world",
+            "  leading and trailing  ",
+            "line one\nline two\r\n\r\n",
+            "123 4567 89",
+            "a'b'c''d",
+            "punctuation!!! ...and 'more'",
+            "héllo wörld — naïve 'test'",
+            "日本語のテキスト 'quote' 123",
+            "emoji 🙂🙃 and 'contractions' aren't rare",
+            "\t\t'tab'\u{a0}nbsp",
+            "'''",
+            "'ll 've 'd 'm 't 's",
+        ];
+        for pattern in [R50K_PAT, CL100K_PAT, O200K_PAT] {
+            assert_same_pieces(pattern, &texts);
+        }
+    }
+
+    #[test]
+    fn test_peeling_is_conservative() {
+        // The two shipped patterns peel their contraction alternative.
+        for pattern in [R50K_PAT, CL100K_PAT] {
+            let (prefix, rest, guards) = super::peel_literal_prefix_alternatives(pattern).unwrap();
+            assert_eq!(guards, vec![b'\'']);
+            assert!(prefix.starts_with('\''));
+            assert!(!rest.contains("[sdmt]"));
+        }
+        // o200k starts with a character class, so nothing is peeled.
+        assert!(super::peel_literal_prefix_alternatives(O200K_PAT).is_none());
+        // Neither are patterns with capture groups, flag setters or `\G`.
+        assert!(super::peel_literal_prefix_alternatives(r"'(a)|\p{L}+").is_none());
+        assert!(super::peel_literal_prefix_alternatives(r"'(?i)a|\p{L}+").is_none());
+        assert!(super::peel_literal_prefix_alternatives(r"\G'a|\p{L}+").is_none());
+        assert!(super::peel_literal_prefix_alternatives(r"'a").is_none());
+        // An optional leading literal is not a guarantee.
+        assert!(super::peel_literal_prefix_alternatives(r"'?a|\p{L}+").is_none());
     }
 }
