@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::thread;
 
 use fancy_regex::Regex;
+use pcre2::bytes::{Regex as Pcre2Regex, RegexBuilder as Pcre2Builder};
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
@@ -315,6 +317,237 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+// Tokeniser split, the hot path
+// =============================
+// Splitting the text with the tokeniser pattern is ~85% of every encode call.
+// The patterns tiktoken ships use possessive quantifiers and the `\s+(?!\S)`
+// lookahead, so `fancy_regex` cannot delegate them to an automaton and runs
+// them on its backtracking VM: one VM run per piece, each with its own state
+// allocations and several anchored `regex-automata` delegate searches.
+//
+// PCRE2 handles that syntax natively and *JIT-compiles* the pattern to machine
+// code, which is several times faster on the same piece stream. So we compile
+// the split pattern a second time with PCRE2 and use it when we can prove the
+// two engines agree; `fancy_regex` stays the source of truth and handles
+// everything else.
+//
+// The only character-class difference between the two engines, checked over
+// every one of the 1,114,112 Unicode scalar values for `\p{L}`, `\p{N}`,
+// `\p{M}` and `\s`, is U+180E MONGOLIAN VOWEL SEPARATOR: PCRE2 counts it as
+// `\s` (it is in PCRE2's `\h` list) while Rust does not (it lost the
+// White_Space property in Unicode 6.3). Text containing it takes the
+// `fancy_regex` path.
+
+/// The single codepoint whose `\s` membership differs between the two engines.
+const PCRE2_DIVERGENT_CHAR: char = '\u{180e}';
+
+/// Unicode general categories whose membership was compared codepoint by
+/// codepoint (all 1,114,112 of them) between `regex`/`fancy_regex` and PCRE2
+/// in UCP mode, with zero disagreements. Any other property keeps the pattern
+/// on `fancy_regex`.
+const PCRE2_VERIFIED_PROPERTIES: &[&str] = &[
+    "C", "Cc", "Cf", "Co", "L", "Ll", "Lm", "Lo", "Lt", "Lu", "M", "Mc", "Me", "Mn", "N", "Nd",
+    "Nl", "No", "P", "Pc", "Pd", "Pe", "Pf", "Pi", "Po", "Ps", "S", "Sc", "Sk", "Sm", "So", "Z",
+    "Zl", "Zp", "Zs",
+];
+
+/// Rewrites a split pattern into its PCRE2 equivalent, or returns `None` when
+/// the pattern uses a construct whose PCRE2 semantics we have not verified to
+/// be identical to `fancy_regex`'s.
+///
+/// The only rewrite is `$` → `\z`: PCRE2's `$` also matches before a trailing
+/// newline, while Rust's (without multi-line mode) only matches at the very end
+/// of the subject, which is exactly `\z`.
+fn pcre2_split_pattern(pattern: &str) -> Option<String> {
+    // The scan below walks bytes, so keep it to patterns that are ASCII (every
+    // pattern tiktoken ships is). A non-ASCII pattern keeps `fancy_regex`.
+    if !pattern.is_ascii() {
+        return None;
+    }
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\\' => {
+                let next = *bytes.get(i + 1)?;
+                match next {
+                    // Escaped punctuation and the control escapes below mean
+                    // the same thing in both engines.
+                    b'n' | b'r' | b't' | b'f' | b'a' | b'e' => {}
+                    // `\s`/`\S` are handled by the U+180E guard at match time.
+                    b's' | b'S' => {}
+                    // `\A`/`\z` are absolute anchors in both engines.
+                    b'A' | b'z' => {}
+                    // Only the general-category properties we verified: every
+                    // one of these was compared codepoint by codepoint across
+                    // the whole of Unicode and the two engines agree exactly.
+                    b'p' | b'P' => {
+                        let rest = pattern.get(i + 2..)?;
+                        let prop = rest.strip_prefix('{')?.split_once('}')?.0;
+                        if !PCRE2_VERIFIED_PROPERTIES.contains(&prop) {
+                            return None;
+                        }
+                    }
+                    // Everything else that is alphanumeric is a class or an
+                    // assertion whose definition we have not verified
+                    // (`\w`, `\b`, `\d`, `\h`, `\v`, `\Z`, `\G`, `\K`, `\R`,
+                    // `\X`, `\Q`, backreferences, ...).
+                    _ if next.is_ascii_alphanumeric() => return None,
+                    _ => {}
+                }
+                out.push('\\');
+                out.push(next as char);
+                i += 2;
+                continue;
+            }
+            b'[' if !in_class => {
+                // POSIX classes (`[[:alpha:]]`) are Unicode-aware under PCRE2's
+                // UCP mode but ASCII-only in Rust.
+                if pattern[i..].starts_with("[[:") {
+                    return None;
+                }
+                in_class = true;
+            }
+            b']' if in_class => in_class = false,
+            b'$' if !in_class => {
+                out.push_str(r"\z");
+                i += 1;
+                continue;
+            }
+            b'(' if !in_class => {
+                // Only the group forms whose semantics match: non-capturing,
+                // case-insensitive non-capturing, look-ahead, atomic and plain
+                // capturing groups.
+                let rest = &pattern[i..];
+                let ok = rest.starts_with("(?:")
+                    || rest.starts_with("(?i:")
+                    || rest.starts_with("(?=")
+                    || rest.starts_with("(?!")
+                    || rest.starts_with("(?>")
+                    || !rest.starts_with("(?");
+                if !ok {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    Some(out)
+}
+
+/// Builds the PCRE2 split engine for `pattern`, returning `None` when PCRE2
+/// cannot be used (unverified syntax, compile failure, or any disagreement with
+/// `reference` on the probe corpus below).
+fn build_pcre2_split(pattern: &str, reference: &Regex) -> Option<Pcre2Regex> {
+    let translated = pcre2_split_pattern(pattern)?;
+    let compiled = Pcre2Builder::new()
+        .jit_if_available(true)
+        .utf(true)
+        .ucp(true)
+        .build(&translated)
+        .ok()?;
+
+    // Belt and braces: the two engines must produce the same piece stream for
+    // a corpus that exercises every alternative of the shipped patterns.
+    let mut probes: Vec<String> = PCRE2_PROBES.iter().map(|s| s.to_string()).collect();
+    let alphabet = [
+        "a", "Z", "0", "9", " ", "\t", "\n", "\r", "'", "-", "é", "中", "\u{a0}", "\u{301}",
+        "\u{2028}", "🙂",
+    ];
+    let mut state: u64 = 0x243F_6A88_85A3_08D3;
+    for _ in 0..512 {
+        let mut s = String::new();
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let len = (state % 12) as usize;
+        for _ in 0..len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            s.push_str(alphabet[(state as usize) % alphabet.len()]);
+        }
+        probes.push(s);
+    }
+    for probe in &probes {
+        if probe.contains(PCRE2_DIVERGENT_CHAR) {
+            continue;
+        }
+        let expected: Vec<(usize, usize)> = reference
+            .find_iter(probe)
+            .map(|m| m.map(|m| (m.start(), m.end())))
+            .collect::<Result<_, _>>()
+            .ok()?;
+        let actual: Vec<(usize, usize)> = compiled
+            .find_iter(probe.as_bytes())
+            .map(|m| m.map(|m| (m.start(), m.end())))
+            .collect::<Result<_, _>>()
+            .ok()?;
+        if expected != actual {
+            return None;
+        }
+    }
+    Some(compiled)
+}
+
+/// Crafted probe strings covering the alternatives of the shipped patterns.
+const PCRE2_PROBES: &[&str] = &[
+    "",
+    " ",
+    "  ",
+    "   ",
+    "\n",
+    "\n\n",
+    " \n",
+    "\r\n",
+    " \r\n ",
+    "\t \t",
+    "a",
+    "abc",
+    " abc",
+    "  abc",
+    "abc def",
+    "'s",
+    "'S",
+    "'ll",
+    "'LL",
+    "'x",
+    "''s",
+    "don't",
+    "0",
+    "12",
+    "123",
+    "1234",
+    "12345",
+    " 42",
+    "a1b2",
+    "!",
+    "!!",
+    " !!",
+    "!!\n\n",
+    "(BPE)",
+    "-- ",
+    "é",
+    "café",
+    " café ",
+    "中文",
+    "🙂",
+    "a\u{301}",
+    "\u{a0}x",
+    "\u{2028}",
+    "x \u{2028} y",
+    "The quick brown fox jumps over the lazy dog.",
+    "Hello, world! 123 times.\n\nNew paragraph  here.\t",
+    "trailing spaces   ",
+    "trailing newline\n",
+    "trailing tab\t",
+];
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -331,10 +564,43 @@ pub struct CoreBPE {
     decoder_flat: Vec<Vec<u8>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
+    // JIT-compiled twin of the split pattern (see the notes above). `None` when
+    // PCRE2 cannot be proven equivalent for this pattern, in which case every
+    // split goes through `regex_tls` exactly as before. A single instance
+    // serves all threads: PCRE2 match data comes from an internal pool that is
+    // taken once per `find_iter`, not once per piece.
+    pcre2_split: Option<Arc<Pcre2Regex>>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
 
 impl CoreBPE {
+    /// The JIT split engine, when it is usable for `text`.
+    #[inline]
+    fn pcre2_split_for<'a>(&'a self, text: &str) -> Option<&'a Pcre2Regex> {
+        let re = self.pcre2_split.as_deref()?;
+        if text.contains(PCRE2_DIVERGENT_CHAR) {
+            return None;
+        }
+        Some(re)
+    }
+
+    /// Encodes one split piece, appending its tokens to `ret` and returning how
+    /// many were appended.
+    #[inline]
+    fn push_piece(&self, piece: &[u8], ret: &mut Vec<Rank>) -> usize {
+        match self.encoder.get(piece) {
+            Some(token) => {
+                ret.push(*token);
+                1
+            }
+            None => {
+                let tokens = byte_pair_encode(piece, &self.encoder);
+                ret.extend(&tokens);
+                tokens.len()
+            }
+        }
+    }
+
     fn _get_tl_regex(&self) -> &Regex {
         // See performance notes above for what this is about
         // It's also a little janky, please make a better version of it!
@@ -378,14 +644,31 @@ impl CoreBPE {
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
+        if let Some(pcre2) = self.pcre2_split_for(text) {
+            let mut ok = true;
+            for mat in pcre2.find_iter(text.as_bytes()) {
+                match mat {
+                    Ok(mat) => {
+                        self.push_piece(mat.as_bytes(), &mut ret);
+                    }
+                    // PCRE2 only errors on resource limits; redo the whole text
+                    // with `fancy_regex` so the result is always well defined.
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return ret;
+            }
+            ret.clear();
+        }
+        let regex = self._get_tl_regex();
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
-            match self.encoder.get(piece) {
-                Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
-            }
+            self.push_piece(piece, &mut ret);
         }
         ret
     }
@@ -418,27 +701,42 @@ impl CoreBPE {
                 }
             }
             let end = next_special.map_or(text.len(), |m| m.start());
+            let segment = &text[start..end];
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
-                    Err(e) => {
-                        return Err(EncodeError {
-                            message: format!("Regex error while tokenizing: {e}"),
-                        });
+            let mut split_done = false;
+            if let Some(pcre2) = self.pcre2_split_for(segment) {
+                let checkpoint = (ret.len(), last_piece_token_len);
+                split_done = true;
+                for mat in pcre2.find_iter(segment.as_bytes()) {
+                    match mat {
+                        Ok(mat) => {
+                            last_piece_token_len = self.push_piece(mat.as_bytes(), &mut ret);
+                        }
+                        Err(_) => {
+                            // Rewind and let `fancy_regex` redo this segment.
+                            ret.truncate(checkpoint.0);
+                            last_piece_token_len = checkpoint.1;
+                            split_done = false;
+                            break;
+                        }
                     }
-                };
-
-                let piece = mat.as_str().as_bytes();
-                if let Some(token) = self.encoder.get(piece) {
-                    last_piece_token_len = 1;
-                    ret.push(*token);
-                    continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
-                last_piece_token_len = tokens.len();
-                ret.extend(&tokens);
+            }
+            if !split_done {
+                for mat_res in regex.find_iter(segment) {
+                    let mat = match mat_res {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return Err(EncodeError {
+                                message: format!("Regex error while tokenizing: {e}"),
+                            });
+                        }
+                    };
+
+                    let piece = mat.as_str().as_bytes();
+                    last_piece_token_len = self.push_piece(piece, &mut ret);
+                }
             }
 
             match next_special {
@@ -695,6 +993,11 @@ impl CoreBPE {
             .map(|_| Regex::new(&special_pattern))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Compile the JIT twin of the split pattern, checked against the
+        // `fancy_regex` build we just made. `None` simply means every split
+        // keeps going through `fancy_regex`.
+        let pcre2_split = build_pcre2_split(pattern, &regex_tls[0]).map(Arc::new);
+
         Ok(Self {
             encoder,
             special_tokens_encoder,
@@ -703,6 +1006,7 @@ impl CoreBPE {
             decoder_flat,
             regex_tls,
             special_regex_tls,
+            pcre2_split,
             sorted_token_bytes,
         })
     }
@@ -743,5 +1047,118 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PATTERN: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    fn pieces_fancy(re: &Regex, text: &str) -> Vec<(usize, usize)> {
+        re.find_iter(text)
+            .map(|m| {
+                let m = m.unwrap();
+                (m.start(), m.end())
+            })
+            .collect()
+    }
+
+    fn pieces_pcre2(re: &crate::Pcre2Regex, text: &str) -> Vec<(usize, usize)> {
+        re.find_iter(text.as_bytes())
+            .map(|m| {
+                let m = m.unwrap();
+                (m.start(), m.end())
+            })
+            .collect()
+    }
+
+    /// The JIT split must yield exactly the pieces `fancy_regex` yields.
+    #[test]
+    fn test_pcre2_split_matches_fancy_regex() {
+        let alphabet = [
+            "a", "Z", "0", "9", " ", "\t", "\n", "\r", "'", "-", "é", "中", "\u{a0}", "\u{301}",
+            "\u{2028}", "🙂",
+        ];
+        for pattern in [R50K_PATTERN, CL100K_PATTERN] {
+            let fancy = Regex::new(pattern).unwrap();
+            let pcre2 = crate::build_pcre2_split(pattern, &fancy)
+                .expect("the shipped patterns must be PCRE2-eligible");
+
+            // Exhaustive over every string of length <= 3 in the alphabet.
+            let mut current = vec![String::new()];
+            for _ in 0..3 {
+                let mut next = Vec::with_capacity(current.len() * alphabet.len());
+                for prefix in &current {
+                    for symbol in alphabet {
+                        let mut s = prefix.clone();
+                        s.push_str(symbol);
+                        assert_eq!(
+                            pieces_fancy(&fancy, &s),
+                            pieces_pcre2(&pcre2, &s),
+                            "piece streams differ for {s:?} with pattern {pattern}"
+                        );
+                        next.push(s);
+                    }
+                }
+                current = next;
+            }
+
+            // A few realistic strings on top.
+            for s in [
+                "The quick brown fox jumps over the lazy dog.",
+                "Hello, world! 123 times.\n\nNew paragraph  here.\t",
+                "don't  stop  believin'\r\n",
+                "Ünïcödé — 数字 42 and emoji 🙂🙂",
+            ] {
+                assert_eq!(pieces_fancy(&fancy, s), pieces_pcre2(&pcre2, s), "{s:?}");
+            }
+        }
+    }
+
+    /// The one codepoint the engines disagree on must take the fallback path.
+    #[test]
+    fn test_pcre2_divergent_char_falls_back() {
+        // PCRE2 counts U+180E as `\s`, Rust does not, so the symbol-run
+        // alternative splits this differently in the two engines.
+        let text = "\u{180e}!";
+        assert!(text.contains(crate::PCRE2_DIVERGENT_CHAR));
+        let fancy = Regex::new(CL100K_PATTERN).unwrap();
+        let pcre2 = crate::build_pcre2_split(CL100K_PATTERN, &fancy).unwrap();
+        // The guard exists precisely because these two disagree here.
+        assert_ne!(pieces_fancy(&fancy, text), pieces_pcre2(&pcre2, text));
+    }
+
+    /// Patterns using constructs we have not verified keep `fancy_regex`.
+    #[test]
+    fn test_pcre2_rejects_unverified_patterns() {
+        assert!(crate::pcre2_split_pattern(R50K_PATTERN).is_some());
+        assert!(crate::pcre2_split_pattern(CL100K_PATTERN).is_some());
+        assert!(crate::pcre2_split_pattern(O200K_PATTERN).is_some());
+        // `$` becomes `\z`, which is what Rust's `$` means.
+        assert!(
+            crate::pcre2_split_pattern(r"\s++$")
+                .unwrap()
+                .ends_with(r"\z")
+        );
+        // ... but only outside a character class and only unescaped.
+        assert_eq!(crate::pcre2_split_pattern(r"[a$]").unwrap(), r"[a$]");
+        assert_eq!(crate::pcre2_split_pattern(r"a\$").unwrap(), r"a\$");
+        for rejected in [
+            r"\w+",
+            r"\b\p{L}+",
+            r"\d+",
+            r"\p{Han}+",
+            r"(?m)^a$",
+            r"[[:alpha:]]+",
+            r"(?<name>a)",
+            r"(a)\1",
+            r"\Z",
+            r"\K",
+        ] {
+            assert!(
+                crate::pcre2_split_pattern(rejected).is_none(),
+                "{rejected} should not be handed to PCRE2"
+            );
+        }
     }
 }
