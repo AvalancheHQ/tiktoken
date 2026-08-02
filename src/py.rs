@@ -200,10 +200,7 @@ impl CoreBPE {
     }
 
     fn decode_single_token_bytes(&self, py: Python, token: Rank) -> PyResult<Py<PyBytes>> {
-        if let Some(bytes) = self.decoder.get(&token) {
-            return Ok(PyBytes::new(py, bytes).into());
-        }
-        if let Some(bytes) = self.special_tokens_decoder.get(&token) {
+        if let Some(bytes) = self.token_bytes(token) {
             return Ok(PyBytes::new(py, bytes).into());
         }
         Err(PyErr::new::<exceptions::PyKeyError, _>(token.to_string()))
@@ -214,9 +211,9 @@ impl CoreBPE {
     // ====================
 
     fn token_byte_values(&self, py: Python) -> Vec<Py<PyBytes>> {
-        self.sorted_token_bytes
+        self.sorted_token_ranks
             .iter()
-            .map(|x| PyBytes::new(py, x).into())
+            .map(|&rank| PyBytes::new(py, self.token_bytes(rank).unwrap_or_default()).into())
             .collect()
     }
 }
