@@ -259,6 +259,19 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
+/// The first eight bytes of `bytes`, packed big-endian and zero padded.
+///
+/// Ordering these keys is the same as ordering the byte strings themselves,
+/// except that two strings sharing an eight byte prefix (or one being a prefix
+/// of the other with `\0` bytes following) tie and have to be compared for
+/// real.
+fn byte_prefix_key(bytes: &[u8]) -> u64 {
+    let mut key = [0u8; 8];
+    let n = bytes.len().min(8);
+    key[..n].copy_from_slice(&bytes[..n]);
+    u64::from_be_bytes(key)
+}
+
 struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -320,18 +333,24 @@ const MAX_NUM_THREADS: usize = 128;
 pub struct CoreBPE {
     encoder: HashMap<Vec<u8>, Rank>,
     special_tokens_encoder: HashMap<String, Rank>,
-    decoder: HashMap<Rank, Vec<u8>>,
-    special_tokens_decoder: HashMap<Rank, Vec<u8>>,
     // Flat, rank-indexed view of every token's bytes (regular + special). Token
     // ranks are dense (`0..=max_rank`), so decoding can resolve a token with a
-    // single bounds-checked slice index instead of hashing into `decoder` and
-    // then falling back to `special_tokens_decoder`. `decode` is the hottest
-    // consumer of this and is dominated by per-token lookups, so replacing the
-    // hash lookup with a direct index is a measurable win.
+    // single bounds-checked slice index instead of hashing into a
+    // `HashMap<Rank, Vec<u8>>` and then falling back to a
+    // `special_tokens_decoder`. `decode` is the hottest consumer of this and is
+    // dominated by per-token lookups, so replacing the hash lookup with a
+    // direct index is a measurable win.
+    //
+    // This is also the *only* rank-keyed copy of the vocabulary: everything
+    // that needs a token's bytes goes through `token_bytes`.
     decoder_flat: Vec<Vec<u8>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
-    sorted_token_bytes: Vec<Vec<u8>>,
+    // Regular token ranks ordered by their bytes, i.e. the sort order of the
+    // vocabulary. Storing ranks rather than a third copy of the token bytes
+    // keeps construction from cloning the whole vocabulary again; the bytes are
+    // read back through `decoder_flat`.
+    sorted_token_ranks: Vec<Rank>,
 }
 
 impl CoreBPE {
@@ -363,6 +382,19 @@ impl CoreBPE {
         }
     }
 
+    /// Bytes of `token`, or an empty slice for a rank with no token.
+    ///
+    /// Used where the rank is known to be valid (e.g. it came out of
+    /// `sorted_token_ranks` or out of an encode), so the miss case only needs
+    /// to be well-defined, not distinguishable.
+    #[inline]
+    fn token_bytes_or_empty(&self, token: Rank) -> &[u8] {
+        match self.decoder_flat.get(token as usize) {
+            Some(bytes) => bytes.as_slice(),
+            None => &[],
+        }
+    }
+
     /// Decodes tokens into a list of bytes.
     ///
     /// The bytes are not gauranteed to be a valid utf-8 string.
@@ -376,10 +408,18 @@ impl CoreBPE {
     }
 
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
+        let mut ret = vec![];
+        self.encode_ordinary_into(self._get_tl_regex(), text, &mut ret);
+        ret
+    }
+
+    /// `encode_ordinary` against a caller-supplied regex slot and output
+    /// vector, so a caller that encodes many short strings in a row can hoist
+    /// the thread-local lookup out of its loop and reuse one allocation.
+    #[inline]
+    fn encode_ordinary_into(&self, regex: &Regex, text: &str, ret: &mut Vec<Rank>) {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
-        let regex = self._get_tl_regex();
-        let mut ret = vec![];
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
             match self.encoder.get(piece) {
@@ -387,7 +427,6 @@ impl CoreBPE {
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
             }
         }
-        ret
     }
 
     pub fn encode(
@@ -472,9 +511,8 @@ impl CoreBPE {
         // pattern. This can e.g. cause "\n" + " " to become "\n \n".
         // Here is a quick and dirty fix:
         {
-            let token_is_all_space = |token| {
-                self.decoder
-                    .get(token)
+            let token_is_all_space = |token: &Rank| {
+                self.token_bytes(*token)
                     .map(|token_bytes| {
                         token_bytes
                             .iter()
@@ -530,60 +568,81 @@ impl CoreBPE {
         // (including tokens that exactly match unstable_bytes)
         // Separating this from the loop below helps with performance in a common case.
         let mut point = self
-            .sorted_token_bytes
-            .partition_point(|x| x.as_slice() < unstable_bytes.as_slice());
-        while point < self.sorted_token_bytes.len()
-            && self.sorted_token_bytes[point].starts_with(&unstable_bytes)
+            .sorted_token_ranks
+            .partition_point(|&rank| self.token_bytes_or_empty(rank) < unstable_bytes.as_slice());
+        while point < self.sorted_token_ranks.len()
+            && self
+                .token_bytes_or_empty(self.sorted_token_ranks[point])
+                .starts_with(&unstable_bytes)
         {
-            completions.insert(vec![
-                self.encoder[self.sorted_token_bytes[point].as_slice()],
-            ]);
+            completions.insert(vec![self.sorted_token_ranks[point]]);
             point += 1;
         }
 
         // Now apply even more brute force. At every (other) possible position for the straddling
         // token, concatenate additional bytes from that token (if any) to unstable_bytes,
         // and retokenise the whole thing and see what we get.
+        //
+        // The body below runs once per vocabulary token that starts with the
+        // suffix, which is thousands of iterations for a short suffix. Nothing
+        // in it needs to allocate per iteration, so the buffers (and the
+        // thread-local regex slot) are hoisted out of the loop and reused; only
+        // a genuinely new completion allocates.
+        let regex = self._get_tl_regex();
+        let mut possibility: Vec<u8> = Vec::new();
+        let mut encoded: Vec<Rank> = Vec::new();
+        let mut seq: Vec<Rank> = Vec::new();
         for i in 1..unstable_bytes.len() {
             let prefix = &unstable_bytes[..i];
             let suffix = &unstable_bytes[i..];
             let mut point = self
-                .sorted_token_bytes
-                .partition_point(|x| x.as_slice() < suffix);
+                .sorted_token_ranks
+                .partition_point(|&rank| self.token_bytes_or_empty(rank) < suffix);
             // TODO: Perf optimisation if suffix starts with " "?
-            while point < self.sorted_token_bytes.len()
-                && self.sorted_token_bytes[point].starts_with(suffix)
+            while point < self.sorted_token_ranks.len()
+                && self
+                    .token_bytes_or_empty(self.sorted_token_ranks[point])
+                    .starts_with(suffix)
             {
-                let possibility = [prefix, self.sorted_token_bytes[point].as_slice()].concat();
-                let encoded = match std::str::from_utf8(&possibility) {
+                possibility.clear();
+                possibility.extend_from_slice(prefix);
+                possibility
+                    .extend_from_slice(self.token_bytes_or_empty(self.sorted_token_ranks[point]));
+                encoded.clear();
+                match std::str::from_utf8(&possibility) {
                     // Morally, this is byte_pair_encode(&possibility, &self.encoder)
                     // But we might have introduced a regex split which would prevent merges.
                     // (particularly possible in the presence of unstable regex splits)
                     // So convert to UTF-8 and do regex splitting.
                     // E.g. with cl100k_base "  !" gets split to " " + " !",
                     // but byte_pair_encode("  !") != byte_pair_encode(" ")
-                    Ok(s) => self.encode_ordinary(s),
+                    Ok(s) => self.encode_ordinary_into(regex, s, &mut encoded),
 
                     // Technically, whether or not this arm is correct depends on whether there
                     // would be a regex split before the UTF-8 truncation point.
                     // Probably niche enough that no one will ever notice (after all, people didn't
                     // notice all the big holes in the previous unstable token implementation)
-                    Err(_) => byte_pair_encode(&possibility, &self.encoder),
+                    Err(_) => encoded.extend(byte_pair_encode(&possibility, &self.encoder)),
                     // Something like the following is intriguing but incorrect:
                     // Err(e) => self.encode_ordinary(unsafe {
                     //     std::str::from_utf8_unchecked(&possibility[..e.valid_up_to()])
                     // }),
                 };
-                let mut seq = Vec::new();
+                seq.clear();
                 let mut seq_len = 0;
-                for token in encoded {
+                for &token in &encoded {
                     seq.push(token);
-                    seq_len += self.decoder[&token].len();
+                    seq_len += self.token_bytes_or_empty(token).len();
                     if seq_len >= unstable_bytes.len() {
                         break;
                     }
                 }
-                completions.insert(seq);
+                // Most candidates retokenise to a completion that is already in
+                // the set, so check membership on the scratch buffer and only
+                // allocate for the ones that are actually new.
+                if !completions.contains(seq.as_slice()) {
+                    completions.insert(seq.clone());
+                }
                 point += 1;
             }
         }
@@ -644,44 +703,68 @@ impl CoreBPE {
             .collect::<Vec<_>>()
             .join("|");
 
-        let decoder: HashMap<Rank, Vec<u8>> =
-            encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
-
-        assert!(
-            encoder.len() == decoder.len(),
-            "Encoder and decoder must be of equal length. Encoder length: {}, decoder length: {}.\nMaybe you had duplicate token indices in your encoder?",
-            encoder.len(),
-            decoder.len()
-        );
-
         let special_tokens_decoder: HashMap<Rank, Vec<u8>> = special_tokens_encoder
             .iter()
             .map(|(k, v)| (*v, k.as_bytes().to_vec()))
             .collect();
 
-        // Build a flat, rank-indexed decode table. Token ranks are dense, so
+        // Build the flat, rank-indexed decode table. Token ranks are dense, so
         // this lets the decode hot path resolve a token with a single indexed
         // slice lookup instead of two hash lookups. Empty slots correspond to
         // ranks with no token (none for well-formed vocabularies).
-        let max_rank = decoder
-            .keys()
+        //
+        // This is the only rank-keyed copy of the vocabulary that gets built:
+        // it is filled straight from `encoder`, so the token bytes are cloned
+        // exactly once here.
+        let max_rank = encoder
+            .values()
             .chain(special_tokens_decoder.keys())
             .copied()
             .max();
-        let decoder_flat: Vec<Vec<u8>> = match max_rank {
-            Some(max_rank) => {
-                let mut flat = vec![Vec::new(); max_rank as usize + 1];
-                for (&rank, bytes) in decoder.iter().chain(special_tokens_decoder.iter()) {
-                    flat[rank as usize] = bytes.clone();
-                }
-                flat
-            }
+        let mut decoder_flat: Vec<Vec<u8>> = match max_rank {
+            Some(max_rank) => vec![Vec::new(); max_rank as usize + 1],
             None => Vec::new(),
         };
+        // Ranks with no token stay empty, so counting the filled slots is the
+        // same duplicate-rank check as comparing the encoder and decoder sizes.
+        let mut distinct_ranks = 0usize;
+        for (bytes, &rank) in encoder.iter() {
+            let slot = &mut decoder_flat[rank as usize];
+            if slot.is_empty() {
+                distinct_ranks += 1;
+            }
+            *slot = bytes.clone();
+        }
+        assert!(
+            encoder.len() == distinct_ranks,
+            "Encoder and decoder must be of equal length. Encoder length: {}, decoder length: {}.\nMaybe you had duplicate token indices in your encoder?",
+            encoder.len(),
+            distinct_ranks
+        );
+        for (&rank, bytes) in special_tokens_decoder.iter() {
+            decoder_flat[rank as usize] = bytes.clone();
+        }
 
-        // Clone because I don't know how to tell Rust I'm not going to change the map
-        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
-        sorted_token_bytes.sort();
+        // Index the vocabulary in byte order. Only the ranks are stored: the
+        // bytes are read back from `decoder_flat`, which avoids cloning the
+        // whole vocabulary a second time.
+        //
+        // Comparing tokens directly here would chase two pointers into a 100k
+        // entry table on every one of the ~1.7M comparisons the sort makes, so
+        // each token is tagged with its first eight bytes packed big-endian
+        // (zero padded). That key orders exactly like the token bytes do, so a
+        // comparison only has to fall back to the bytes when two keys are equal
+        // — i.e. for tokens sharing an eight byte prefix, which is rare.
+        let mut keyed: Vec<(u64, Rank)> = encoder
+            .iter()
+            .map(|(bytes, &rank)| (byte_prefix_key(bytes), rank))
+            .collect();
+        keyed.sort_unstable_by(|&(key_a, a), &(key_b, b)| {
+            key_a
+                .cmp(&key_b)
+                .then_with(|| decoder_flat[a as usize].cmp(&decoder_flat[b as usize]))
+        });
+        let sorted_token_ranks: Vec<Rank> = keyed.into_iter().map(|(_, rank)| rank).collect();
 
         // Compile an independent regex per thread-local slot instead of cloning one. Cloning a
         // `fancy_regex::Regex` shares an `Arc<Prog>` whose regex-automata engines keep their scratch
@@ -698,12 +781,10 @@ impl CoreBPE {
         Ok(Self {
             encoder,
             special_tokens_encoder,
-            decoder,
-            special_tokens_decoder,
             decoder_flat,
             regex_tls,
             special_regex_tls,
-            sorted_token_bytes,
+            sorted_token_ranks,
         })
     }
 
@@ -743,5 +824,45 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    #[test]
+    fn test_sorted_token_ranks_are_in_byte_order() {
+        // Includes tokens that share an eight byte prefix and tokens with `\0`
+        // bytes, i.e. exactly the cases where the packed sort key ties and the
+        // comparison has to fall back to the token bytes.
+        let tokens: Vec<Vec<u8>> = vec![
+            b"b".to_vec(),
+            b"a".to_vec(),
+            b"a\0".to_vec(),
+            b"ab".to_vec(),
+            b"abcdefgh".to_vec(),
+            b"abcdefgh\0".to_vec(),
+            b"abcdefghi".to_vec(),
+            b"abcdefgha".to_vec(),
+            vec![0x00],
+            vec![0xff],
+            vec![0xff, 0x00],
+        ];
+        let encoder: Vec<(Vec<u8>, Rank)> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), i as Rank))
+            .collect();
+        let bpe = crate::CoreBPE::new::<_, _, Vec<(String, (Rank, Rank))>>(
+            encoder,
+            Vec::<(String, Rank)>::new(),
+            "a",
+        )
+        .unwrap();
+
+        let mut expected = tokens.clone();
+        expected.sort();
+        let actual: Vec<Vec<u8>> = bpe
+            .sorted_token_ranks
+            .iter()
+            .map(|&rank| bpe.token_bytes_or_empty(rank).to_vec())
+            .collect();
+        assert_eq!(actual, expected);
     }
 }
