@@ -6,7 +6,7 @@ use pyo3::{
     pybacked::PyBackedStr,
     types::{PyBytes, PyList},
 };
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 
 use crate::{CoreBPE, Rank, byte_pair_encode};
 
@@ -121,7 +121,7 @@ impl CoreBPE {
         text: &str,
         allowed_special: HashSet<PyBackedStr>,
     ) -> PyResult<(Vec<Rank>, Py<PyList>)> {
-        let (tokens, completions): (Vec<Rank>, HashSet<Vec<Rank>>) = py.detach(|| {
+        let (tokens, completions): (Vec<Rank>, FxHashSet<Vec<Rank>>) = py.detach(|| {
             let allowed_special: HashSet<&str> =
                 allowed_special.iter().map(|s| s.as_ref()).collect();
             self._encode_unstable_native(text, &allowed_special)
