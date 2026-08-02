@@ -56,6 +56,22 @@ class Encoding:
 
         self._core_bpe = _tiktoken.CoreBPE(mergeable_ranks, special_tokens, pat_str)
 
+        # Worker pools for the batch helpers, keyed by thread count. They are
+        # kept alive between calls: the core keeps per-thread tokeniser state
+        # (its thread-local split regexes and their automaton scratch), so a
+        # fresh worker has to rebuild that state before it can tokenise
+        # anything. Reusing the workers pays that cost once instead of on every
+        # batch call.
+        self._executors: dict[int, ThreadPoolExecutor] = {}
+
+    def _executor(self, num_threads: int) -> ThreadPoolExecutor:
+        """Returns this encoding's worker pool for `num_threads`, creating it once."""
+        executor = self._executors.get(num_threads)
+        if executor is None:
+            executor = ThreadPoolExecutor(num_threads)
+            self._executors[num_threads] = executor
+        return executor
+
     def __repr__(self) -> str:
         return f"<Encoding {self.name!r}>"
 
@@ -172,8 +188,7 @@ class Encoding:
         ```
         """
         encoder = functools.partial(self.encode_ordinary)
-        with ThreadPoolExecutor(num_threads) as e:
-            return list(e.map(encoder, text))
+        return list(self._executor(num_threads).map(encoder, text))
 
     def encode_batch(
         self,
@@ -202,8 +217,7 @@ class Encoding:
         encoder = functools.partial(
             self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
         )
-        with ThreadPoolExecutor(num_threads) as e:
-            return list(e.map(encoder, text))
+        return list(self._executor(num_threads).map(encoder, text))
 
     def encode_with_unstable(
         self,
@@ -339,15 +353,13 @@ class Encoding:
     ) -> list[str]:
         """Decodes a batch (list of lists of tokens) into a list of strings."""
         decoder = functools.partial(self.decode, errors=errors)
-        with ThreadPoolExecutor(num_threads) as e:
-            return list(e.map(decoder, batch))
+        return list(self._executor(num_threads).map(decoder, batch))
 
     def decode_bytes_batch(
         self, batch: Sequence[Sequence[int]], *, num_threads: int = 8
     ) -> list[bytes]:
         """Decodes a batch (list of lists of tokens) into a list of bytes."""
-        with ThreadPoolExecutor(num_threads) as e:
-            return list(e.map(self.decode_bytes, batch))
+        return list(self._executor(num_threads).map(self.decode_bytes, batch))
 
     # ====================
     # Miscellaneous
