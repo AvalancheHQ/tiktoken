@@ -82,6 +82,26 @@ def test_decode(benchmark, encoding_name: str, size: str) -> None:
     assert text
 
 
+# `encode_with_unstable` is used to encode a partial prompt: the trailing bytes
+# are unstable, so it also returns every token sequence the prompt could
+# continue with. The interesting inputs therefore end mid-word, and the cost is
+# driven by how many vocabulary tokens start with that trailing fragment.
+UNSTABLE_PROMPTS = {
+    "word": "Language models see a sequence of numbers known as tok",
+    "fragment": "hello fanta",
+}
+
+
+@pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
+@pytest.mark.parametrize("prompt", list(UNSTABLE_PROMPTS))
+def test_encode_with_unstable(benchmark, encoding_name: str, prompt: str) -> None:
+    enc = _get_encoding(encoding_name)
+    text = UNSTABLE_PROMPTS[prompt]
+    tokens, completions = benchmark(enc.encode_with_unstable, text)
+    assert tokens
+    assert completions
+
+
 @pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
 def test_encode_ordinary_batch(benchmark, encoding_name: str) -> None:
     enc = _get_encoding(encoding_name)

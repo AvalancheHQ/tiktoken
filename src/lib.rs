@@ -5,7 +5,7 @@ use std::thread;
 use fancy_regex::Regex;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 
 #[cfg(feature = "python")]
 mod py;
@@ -390,6 +390,49 @@ impl CoreBPE {
         ret
     }
 
+    /// Encodes `text` like [`Self::encode_ordinary`], but stops as soon as the
+    /// tokens produced cover at least `min_bytes` bytes of `text`, appending
+    /// them to `out` (which is cleared first).
+    ///
+    /// A token decodes back to exactly the bytes it was encoded from, so the
+    /// tokens emitted here are exactly the leading tokens `encode_ordinary`
+    /// would have returned; the remaining pieces are simply never split or
+    /// merged. This is what the unstable-completion search needs: it only ever
+    /// keeps the tokens that cover the unstable bytes and throws the rest away.
+    fn encode_ordinary_prefix(&self, text: &str, min_bytes: usize, out: &mut Vec<Rank>) {
+        out.clear();
+        let regex = self._get_tl_regex();
+        let mut covered = 0;
+        for mat in regex.find_iter(text) {
+            let piece = mat.unwrap().as_str().as_bytes();
+            match self.encoder.get(piece) {
+                Some(token) => out.push(*token),
+                None => {
+                    let tokens = byte_pair_encode(piece, &self.encoder);
+                    if covered + piece.len() < min_bytes {
+                        // The whole piece is still short of the target, so the
+                        // per-token lengths are not needed: they sum to the
+                        // piece length.
+                        out.extend(&tokens);
+                    } else {
+                        for token in tokens {
+                            out.push(token);
+                            covered += self.token_bytes(token).map_or(0, <[u8]>::len);
+                            if covered >= min_bytes {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            covered += piece.len();
+            if covered >= min_bytes {
+                return;
+            }
+        }
+    }
+
     pub fn encode(
         &self,
         text: &str,
@@ -502,12 +545,12 @@ impl CoreBPE {
         &self,
         text: &str,
         allowed_special: &HashSet<&str>,
-    ) -> (Vec<Rank>, HashSet<Vec<Rank>>) {
+    ) -> (Vec<Rank>, FxHashSet<Vec<Rank>>) {
         let (tokens, last_piece_token_len) = self.encode(text, allowed_special).unwrap();
         if last_piece_token_len == 0 {
             // If last_piece_token_len is zero, the last token was a special token and we have
             // no unstable bytes
-            return (tokens, HashSet::new());
+            return (tokens, FxHashSet::default());
         }
         let (mut tokens, last_piece_token_len) =
             self._increase_last_piece_token_len(tokens, last_piece_token_len);
@@ -521,7 +564,11 @@ impl CoreBPE {
         // This would reduce the amount of retokenising when determining completions
         // Refer to the logic in an older version of this file
 
-        let mut completions = HashSet::new();
+        // The candidate loop below probes this set far more often than it grows
+        // it (most candidates re-derive a sequence that is already in it), so it
+        // uses the same fast hasher as the vocabulary maps rather than the
+        // default SipHash.
+        let mut completions = FxHashSet::default();
         if unstable_bytes.is_empty() {
             return (tokens, completions);
         }
@@ -544,6 +591,14 @@ impl CoreBPE {
         // Now apply even more brute force. At every (other) possible position for the straddling
         // token, concatenate additional bytes from that token (if any) to unstable_bytes,
         // and retokenise the whole thing and see what we get.
+        //
+        // Only the leading tokens that cover `unstable_bytes` are ever kept, so
+        // both the concatenation buffer and the token buffer are reused across
+        // candidates and the retokenisation stops as soon as those bytes are
+        // covered, instead of tokenising the whole candidate and discarding the
+        // tail.
+        let mut possibility = Vec::new();
+        let mut seq = Vec::new();
         for i in 1..unstable_bytes.len() {
             let prefix = &unstable_bytes[..i];
             let suffix = &unstable_bytes[i..];
@@ -554,36 +609,43 @@ impl CoreBPE {
             while point < self.sorted_token_bytes.len()
                 && self.sorted_token_bytes[point].starts_with(suffix)
             {
-                let possibility = [prefix, self.sorted_token_bytes[point].as_slice()].concat();
-                let encoded = match std::str::from_utf8(&possibility) {
+                possibility.clear();
+                possibility.extend_from_slice(prefix);
+                possibility.extend_from_slice(self.sorted_token_bytes[point].as_slice());
+                match std::str::from_utf8(&possibility) {
                     // Morally, this is byte_pair_encode(&possibility, &self.encoder)
                     // But we might have introduced a regex split which would prevent merges.
                     // (particularly possible in the presence of unstable regex splits)
                     // So convert to UTF-8 and do regex splitting.
                     // E.g. with cl100k_base "  !" gets split to " " + " !",
                     // but byte_pair_encode("  !") != byte_pair_encode(" ")
-                    Ok(s) => self.encode_ordinary(s),
+                    Ok(s) => self.encode_ordinary_prefix(s, unstable_bytes.len(), &mut seq),
 
                     // Technically, whether or not this arm is correct depends on whether there
                     // would be a regex split before the UTF-8 truncation point.
                     // Probably niche enough that no one will ever notice (after all, people didn't
                     // notice all the big holes in the previous unstable token implementation)
-                    Err(_) => byte_pair_encode(&possibility, &self.encoder),
                     // Something like the following is intriguing but incorrect:
                     // Err(e) => self.encode_ordinary(unsafe {
                     //     std::str::from_utf8_unchecked(&possibility[..e.valid_up_to()])
                     // }),
-                };
-                let mut seq = Vec::new();
-                let mut seq_len = 0;
-                for token in encoded {
-                    seq.push(token);
-                    seq_len += self.decoder[&token].len();
-                    if seq_len >= unstable_bytes.len() {
-                        break;
+                    Err(_) => {
+                        seq.clear();
+                        let mut seq_len = 0;
+                        for token in byte_pair_encode(&possibility, &self.encoder) {
+                            seq.push(token);
+                            seq_len += self.token_bytes(token).map_or(0, <[u8]>::len);
+                            if seq_len >= unstable_bytes.len() {
+                                break;
+                            }
+                        }
                     }
+                };
+                // Candidates repeat the same completion often, so only pay for
+                // an owned copy when the sequence is actually new.
+                if !completions.contains(seq.as_slice()) {
+                    completions.insert(seq.clone());
                 }
-                completions.insert(seq);
                 point += 1;
             }
         }
