@@ -307,7 +307,9 @@ class Encoding:
         >>> enc.decode_tokens_bytes([31373, 995])
         [b'hello', b' world']
         """
-        return [self.decode_single_token_bytes(token) for token in tokens]
+        # Resolved in the Rust core: this used to be one Python-level call into
+        # the core per token.
+        return self._core_bpe.decode_tokens_bytes(tokens)
 
     def decode_with_offsets(self, tokens: Sequence[int]) -> tuple[str, list[int]]:
         """Decodes a list of tokens into a string and a list of offsets.

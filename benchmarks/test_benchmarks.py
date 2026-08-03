@@ -83,6 +83,21 @@ def test_decode(benchmark, encoding_name: str, size: str) -> None:
 
 
 @pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
+@pytest.mark.parametrize("size", list(TEXT_SIZES))
+def test_decode_tokens_bytes(benchmark, encoding_name: str, size: str) -> None:
+    """Decoding a token list into the bytes of each individual token.
+
+    This is the API used to inspect a tokenisation (token visualisation,
+    per-token alignment), so it is exercised on the same inputs as
+    ``test_decode``.
+    """
+    enc = _get_encoding(encoding_name)
+    tokens = enc.encode_ordinary(TEXT_SIZES[size])
+    token_bytes = benchmark(enc.decode_tokens_bytes, tokens)
+    assert len(token_bytes) == len(tokens)
+
+
+@pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
 def test_encode_ordinary_batch(benchmark, encoding_name: str) -> None:
     enc = _get_encoding(encoding_name)
     documents = [TEXT_SIZES["medium"]] * 64
