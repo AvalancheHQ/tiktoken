@@ -322,16 +322,12 @@ class Encoding:
         >>> enc.decode_with_offsets([31373, 995])
         ('hello world', [0, 5])
         """
-        token_bytes = self.decode_tokens_bytes(tokens)
-
-        text_len = 0
-        offsets = []
-        for token in token_bytes:
-            offsets.append(max(0, text_len - (0x80 <= token[0] < 0xC0)))
-            text_len += sum(1 for c in token if not 0x80 <= c < 0xC0)
+        # The offsets are computed in the Rust core: doing it here meant one
+        # Python-level call (and one `bytes` object) per token.
+        token_bytes, offsets = self._core_bpe.decode_bytes_with_offsets(tokens)
 
         # TODO: assess correctness for errors="ignore" and errors="replace"
-        text = b"".join(token_bytes).decode("utf-8", errors="strict")
+        text = token_bytes.decode("utf-8", errors="strict")
         return text, offsets
 
     def decode_batch(
