@@ -41,11 +41,16 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: llvm-tools
 
       - name: Install tiktoken and benchmark dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e . pytest pytest-codspeed
+          pip install pytest pytest-codspeed
+          # Build the Rust core with profile-guided optimisation; the tokeniser
+          # hot path is a branchy regex VM, which PGO lays out much better.
+          ./scripts/pgo_build.sh -e .
 
       - name: Run benchmarks
         uses: CodSpeedHQ/action@f99becdce5e5d51fd556489ebef684f4ecfd6286 # v4.18.5
