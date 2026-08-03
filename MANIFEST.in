@@ -4,6 +4,7 @@ include *.md
 include Makefile
 global-include py.typed
 recursive-include scripts *.py
+recursive-include scripts *.sh
 recursive-include benchmarks *.py
 recursive-include tests *.py
 recursive-include src *.rs
