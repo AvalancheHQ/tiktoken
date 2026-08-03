@@ -4,6 +4,8 @@ import base64
 import hashlib
 import os
 
+from tiktoken import _tiktoken
+
 
 def read_file(blobpath: str) -> bytes:
     if "://" not in blobpath:
@@ -159,6 +161,16 @@ def dump_tiktoken_bpe(bpe_ranks: dict[bytes, int], tiktoken_bpe_file: str) -> No
 def load_tiktoken_bpe(tiktoken_bpe_file: str, expected_hash: str | None = None) -> dict[bytes, int]:
     # NB: do not add caching to this function
     contents = read_file_cached(tiktoken_bpe_file, expected_hash)
+
+    # Parse the whole file in the Rust core: a line at a time in Python costs
+    # several times as much as everything else about loading an encoding. The
+    # core returns None for files that are not in the canonical
+    # `base64(token) rank` form; those take the Python parser below and so keep
+    # raising exactly the errors they used to.
+    ret = _tiktoken.parse_mergeable_ranks(contents)
+    if ret is not None:
+        return ret
+
     ret = {}
     for line in contents.splitlines():
         if not line:

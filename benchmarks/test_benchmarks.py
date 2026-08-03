@@ -18,6 +18,7 @@ import functools
 import pytest
 
 import tiktoken
+import tiktoken.load
 
 # Encodings covering the two main BPE regex/vocabulary generations used by
 # OpenAI models: the GPT-2/GPT-3 family (gpt2) and the GPT-4 family (cl100k_base).
@@ -80,6 +81,30 @@ def test_decode(benchmark, encoding_name: str, size: str) -> None:
     tokens = enc.encode_ordinary(TEXT_SIZES[size])
     text = benchmark(enc.decode, tokens)
     assert text
+
+
+# Vocabulary files in the `.tiktoken` format (one `base64(token) rank` line per
+# token), i.e. the vocabularies of every modern OpenAI encoding. Parsing one is
+# what a fresh process pays before it can encode anything: the file is served
+# from tiktoken's on-disk cache, but the mergeable-ranks table is rebuilt in
+# every process.
+VOCAB_FILES = {
+    "cl100k_base": (
+        "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken",
+        "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
+    ),
+}
+
+
+@pytest.mark.parametrize("vocab_name", list(VOCAB_FILES))
+def test_load_mergeable_ranks(benchmark, vocab_name: str) -> None:
+    blobpath, expected_hash = VOCAB_FILES[vocab_name]
+    # Populate tiktoken's on-disk cache so the download is not measured.
+    tiktoken.load.read_file_cached(blobpath, expected_hash)
+    ranks = benchmark(
+        functools.partial(tiktoken.load.load_tiktoken_bpe, blobpath, expected_hash)
+    )
+    assert len(ranks) > 100_000
 
 
 @pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
