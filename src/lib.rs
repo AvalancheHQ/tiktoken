@@ -363,6 +363,19 @@ impl CoreBPE {
         }
     }
 
+    /// Resolves every token to its own bytes, in order.
+    ///
+    /// This is the batched form of a single token lookup, for callers that want
+    /// the bytes of each token separately rather than the concatenation
+    /// [`Self::decode_bytes`] produces. The returned slices borrow the decode
+    /// table, so nothing is copied.
+    pub fn decode_tokens_bytes(&self, tokens: &[Rank]) -> Result<Vec<&[u8]>, DecodeKeyError> {
+        tokens
+            .iter()
+            .map(|&token| self.token_bytes(token).ok_or(DecodeKeyError { token }))
+            .collect()
+    }
+
     /// Decodes tokens into a list of bytes.
     ///
     /// The bytes are not gauranteed to be a valid utf-8 string.

@@ -199,6 +199,43 @@ impl CoreBPE {
         }
     }
 
+    /// Decodes every token into its own `bytes` object, in a single call.
+    ///
+    /// `Encoding.decode_tokens_bytes` used to call `decode_single_token_bytes`
+    /// once per token, so each token paid a Python frame, a pyo3 trampoline, a
+    /// GIL-state guard and an argument conversion on top of the lookup itself.
+    /// Walking the sequence here leaves only the work that has to happen: one
+    /// indexed table lookup and one `bytes` object per token.
+    #[pyo3(name = "decode_tokens_bytes")]
+    fn py_decode_tokens_bytes(
+        &self,
+        py: Python,
+        tokens: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyList>> {
+        // Fast path for the common case where `tokens` is a concrete `list`, as
+        // in `decode_bytes`: read each token with the CPython C-API and resolve
+        // it straight away, so the tokens are walked exactly once and no
+        // intermediate `Vec<Rank>` is built.
+        if let Ok(list) = tokens.downcast::<PyList>() {
+            let mut items: Vec<Bound<'_, PyBytes>> = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                let token = read_rank(&item)?;
+                let token_bytes = self
+                    .token_bytes(token)
+                    .ok_or_else(|| PyErr::new::<exceptions::PyKeyError, _>(token.to_string()))?;
+                items.push(PyBytes::new(py, token_bytes));
+            }
+            return Ok(PyList::new(py, items)?.unbind());
+        }
+
+        // Anything else keeps the generic extraction path.
+        let tokens: Vec<Rank> = tokens.extract()?;
+        let token_bytes = self
+            .decode_tokens_bytes(&tokens)
+            .map_err(|e| PyErr::new::<exceptions::PyKeyError, _>(e.token.to_string()))?;
+        Ok(PyList::new(py, token_bytes.into_iter().map(|b| PyBytes::new(py, b)))?.unbind())
+    }
+
     fn decode_single_token_bytes(&self, py: Python, token: Rank) -> PyResult<Py<PyBytes>> {
         if let Some(bytes) = self.decoder.get(&token) {
             return Ok(PyBytes::new(py, bytes).into());
