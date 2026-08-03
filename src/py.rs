@@ -4,11 +4,14 @@ use pyo3::{
     IntoPyObjectExt, PyResult, exceptions,
     prelude::*,
     pybacked::PyBackedStr,
-    types::{PyBytes, PyList},
+    types::{PyBytes, PyDict, PyList},
 };
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::{CoreBPE, Rank, byte_pair_encode};
+use crate::{
+    CoreBPE, Rank, base64_decode_into, base64_decoded_len, byte_pair_encode, split_vocab_line,
+    vocab_lines,
+};
 
 #[pymethods]
 impl CoreBPE {
@@ -308,8 +311,49 @@ impl TiktokenBuffer {
     }
 }
 
+/// Parses the contents of a `.tiktoken` vocabulary file into its
+/// `{token bytes: rank}` mapping.
+///
+/// This is the same work as the per-line Python loop in `tiktoken/load.py`, done
+/// in a single pass here: the file is split into lines, each token is
+/// base64-decoded straight into its final Python `bytes` object, and the rank is
+/// parsed from its decimal digits.
+///
+/// Returns `None` if the file is not in the canonical form written by
+/// `dump_tiktoken_bpe` (`base64(token) rank` per line, with padding, separated
+/// by a single space). The caller then falls back to the more permissive Python
+/// parser, so unusual files keep their exact previous behaviour — including
+/// which error they raise.
+#[pyfunction]
+fn parse_mergeable_ranks<'py>(
+    py: Python<'py>,
+    contents: &[u8],
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let ranks = PyDict::new(py);
+    for line in vocab_lines(contents) {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((token_base64, rank)) = split_vocab_line(line) else {
+            return Ok(None);
+        };
+        let Some(decoded_len) = base64_decoded_len(token_base64) else {
+            return Ok(None);
+        };
+        // Decode into the `bytes` object's buffer directly: no intermediate
+        // `Vec<u8>` per token.
+        let token = PyBytes::new_with(py, decoded_len, |buffer| {
+            base64_decode_into(token_base64, buffer);
+            Ok(())
+        })?;
+        ranks.set_item(token, rank)?;
+    }
+    Ok(Some(ranks))
+}
+
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<CoreBPE>()?;
+    m.add_function(wrap_pyfunction!(parse_mergeable_ranks, m)?)?;
     Ok(())
 }

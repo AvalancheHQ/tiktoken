@@ -12,6 +12,119 @@ mod py;
 
 pub type Rank = u32;
 
+// ============================================================================
+// `.tiktoken` vocabulary files
+// ============================================================================
+//
+// A `.tiktoken` file holds one `base64(token) rank` line per token, which is
+// exactly the `mergeable_ranks` table `CoreBPE` is built from. Parsing it is
+// the first thing any process does with an encoding, and doing it a line at a
+// time in Python costs more than everything else about loading put together
+// (interpreter dispatch, a `bytes` object per line and per field, and a
+// `base64.b64decode` call per token). The primitives below let the whole file
+// be parsed here instead, at the cost of one pass over the bytes.
+//
+// They deliberately only accept the canonical form written by
+// `dump_tiktoken_bpe` (`base64` with padding, a single space, decimal rank).
+// Anything else is reported as "not canonical" so the caller can fall back to
+// the more permissive Python parser rather than silently disagreeing with it.
+
+/// Lookup table mapping a byte to its standard-base64 alphabet value, or
+/// [`B64_INVALID`] if it is not part of the alphabet (`=` included).
+static B64_DECODE_TABLE: [u8; 256] = {
+    let mut table = [B64_INVALID; 256];
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut i = 0;
+    while i < alphabet.len() {
+        table[alphabet[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+};
+
+const B64_INVALID: u8 = 0xFF;
+
+/// Validates `input` as padded standard base64 and returns the length of its
+/// decoded form, or `None` if it is not padded standard base64.
+///
+/// Trailing bits of a partial final group are ignored rather than rejected,
+/// which is what Python's non-validating `base64.b64decode` does.
+pub fn base64_decoded_len(input: &[u8]) -> Option<usize> {
+    let len = input.len();
+    if len == 0 || len % 4 != 0 {
+        return None;
+    }
+    // Padding is only allowed as the last one or two bytes; the alphabet table
+    // rejects `=` anywhere else.
+    let mut padding = 0;
+    if input[len - 1] == b'=' {
+        padding = if input[len - 2] == b'=' { 2 } else { 1 };
+    }
+    for &byte in &input[..len - padding] {
+        if B64_DECODE_TABLE[byte as usize] == B64_INVALID {
+            return None;
+        }
+    }
+    Some(len / 4 * 3 - padding)
+}
+
+/// Decodes `input` (already validated by [`base64_decoded_len`]) into `out`,
+/// which must be exactly `base64_decoded_len(input)` bytes long.
+pub fn base64_decode_into(input: &[u8], out: &mut [u8]) {
+    debug_assert_eq!(base64_decoded_len(input), Some(out.len()));
+    let mut written = 0;
+    for group in input.chunks_exact(4) {
+        let first = B64_DECODE_TABLE[group[0] as usize];
+        let second = B64_DECODE_TABLE[group[1] as usize];
+        out[written] = (first << 2) | (second >> 4);
+        written += 1;
+        if group[2] == b'=' {
+            break;
+        }
+        let third = B64_DECODE_TABLE[group[2] as usize];
+        out[written] = (second << 4) | (third >> 2);
+        written += 1;
+        if group[3] == b'=' {
+            break;
+        }
+        out[written] = (third << 6) | B64_DECODE_TABLE[group[3] as usize];
+        written += 1;
+    }
+    debug_assert_eq!(written, out.len());
+}
+
+/// Splits one canonical `.tiktoken` line into its base64 token and its rank, or
+/// returns `None` if the line is not `<base64> <decimal rank>`.
+pub fn split_vocab_line(line: &[u8]) -> Option<(&[u8], Rank)> {
+    let space = line.iter().position(|&byte| byte == b' ')?;
+    let (token, rank) = (&line[..space], &line[space + 1..]);
+    if token.is_empty() || rank.is_empty() {
+        return None;
+    }
+    let mut value: Rank = 0;
+    for &byte in rank {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(Rank::from(digit))?;
+    }
+    Some((token, value))
+}
+
+/// Iterates over the lines of a `.tiktoken` file, accepting `\n` and `\r\n`
+/// terminators. Empty lines are yielded and skipped by the caller, matching
+/// Python's `bytes.splitlines()` for these two terminators.
+pub fn vocab_lines(contents: &[u8]) -> impl Iterator<Item = &[u8]> {
+    contents.split(|&byte| byte == b'\n').map(|line| {
+        if let [rest @ .., b'\r'] = line {
+            rest
+        } else {
+            line
+        }
+    })
+}
+
 use std::collections::BinaryHeap;
 
 #[derive(Eq, PartialEq, Clone, Copy)]
@@ -743,5 +856,63 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+        let len = crate::base64_decoded_len(input)?;
+        let mut out = vec![0; len];
+        crate::base64_decode_into(input, &mut out);
+        Some(out)
+    }
+
+    #[test]
+    fn test_base64_decode() {
+        assert_eq!(base64_decode(b"IQ==").unwrap(), b"!");
+        assert_eq!(base64_decode(b"YWI=").unwrap(), b"ab");
+        assert_eq!(base64_decode(b"YWJj").unwrap(), b"abc");
+        assert_eq!(base64_decode(b"YWJjZA==").unwrap(), b"abcd");
+        assert_eq!(base64_decode(b"+/+/").unwrap(), [0xfb, 0xff, 0xbf]);
+    }
+
+    #[test]
+    fn test_base64_decode_rejects_non_canonical() {
+        for input in [
+            &b""[..],   // empty
+            b"IQ",      // unpadded
+            b"IQ=",     // wrong length
+            b"I=Q=",    // padding in the middle
+            b"I!==",    // outside the alphabet
+            b"IQ== ",   // trailing space
+            b"IQ==IQ=", // second group not a multiple of 4
+        ] {
+            assert_eq!(crate::base64_decoded_len(input), None, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn test_split_vocab_line() {
+        assert_eq!(
+            crate::split_vocab_line(b"IQ== 12"),
+            Some((&b"IQ=="[..], 12))
+        );
+        assert_eq!(crate::split_vocab_line(b"IQ== 0"), Some((&b"IQ=="[..], 0)));
+        for line in [
+            &b"IQ=="[..],       // no rank
+            b" 12",             // no token
+            b"IQ== ",           // empty rank
+            b"IQ==  12",        // double space
+            b"IQ==\t12",        // tab separator
+            b"IQ== 12 13",      // extra field
+            b"IQ== +12",        // signed rank
+            b"IQ== 4294967296", // does not fit in a Rank
+        ] {
+            assert_eq!(crate::split_vocab_line(line), None, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn test_vocab_lines() {
+        let lines: Vec<_> = crate::vocab_lines(b"a 1\r\nb 2\n\nc 3").collect();
+        assert_eq!(lines, vec![&b"a 1"[..], b"b 2", b"", b"c 3"]);
     }
 }
