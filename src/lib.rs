@@ -1,10 +1,16 @@
 use std::collections::HashSet;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::thread;
 
 use fancy_regex::Regex;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+use regex_automata::{
+    Anchored, MatchKind,
+    dfa::{Automaton, StartKind, dense},
+    util::primitives::StateID,
+};
 use rustc_hash::FxHashMap as HashMap;
 
 #[cfg(feature = "python")]
@@ -274,6 +280,473 @@ fn hash_current_thread() -> usize {
     u64::from(x) as usize
 }
 
+// ============================================================================
+// Tokeniser split
+// ============================================================================
+//
+// The split is where encoding spends most of its time. `fancy_regex` has to
+// interpret the tokeniser patterns on its backtracking VM (they use possessive
+// quantifiers and the `\s+(?!\S)` look-ahead), and it pays that VM's fixed cost
+// -- a fresh match state, backtrack bookkeeping and one delegated
+// `regex-automata` search per alternative it tries -- *once per piece*, for a
+// piece that is only a handful of bytes.
+//
+// Almost every piece of real text, though, is produced by the pattern's leading
+// alternatives, none of which need look-around. `SplitDfa` compiles those into
+// a single byte-level DFA, so a piece costs one anchored DFA pass over its own
+// bytes: no VM, no backtrack stack, no per-piece allocation. The DFA is
+// immutable and needs no scratch space, so one copy serves every thread.
+//
+// `fancy_regex` remains the source of truth: it decides every position the DFA
+// does not match (whitespace runs, and anything at all for a pattern the
+// analysis below does not fully understand).
+
+/// Byte-level DFA recognising the leading, look-around-free top-level
+/// alternatives of a tokeniser split pattern.
+struct SplitDfa {
+    dfa: dense::DFA<Vec<u32>>,
+    /// The anchored start state. None of the alternatives the DFA covers can
+    /// look before the piece start (`plain_alternative` rejects `^`, `\A`,
+    /// `\b`, ...), so the start state is the same at every position and does
+    /// not have to be looked up per piece.
+    start: StateID,
+}
+
+/// Limits for building the DFA. The tokeniser patterns' Unicode classes make
+/// for a sizeable automaton; anything that does not fit keeps `fancy_regex`.
+const SPLIT_DFA_SIZE_LIMIT: usize = 8 * (1 << 20);
+const SPLIT_DETERMINIZE_SIZE_LIMIT: usize = 32 * (1 << 20);
+
+impl SplitDfa {
+    /// Returns the end of the piece the split produces at `at`, or `None` when
+    /// none of the alternatives the DFA covers match there.
+    ///
+    /// This is `regex-automata`'s anchored forward search, specialised to what
+    /// a tokeniser split needs: the start state is known up front, there is no
+    /// prefilter (the search is anchored) and a match is never reported early,
+    /// so the whole search is one transition per byte of the piece. Running the
+    /// automaton directly like this keeps the per-piece cost proportional to
+    /// the piece, which matters because a piece is only a handful of bytes.
+    #[inline]
+    fn piece_end(&self, text: &str, at: usize) -> Option<usize> {
+        let dfa = &self.dfa;
+        let haystack = text.as_bytes();
+        let mut sid = self.start;
+        // Matches are delayed by one byte: a match state is entered by reading
+        // the byte *after* the end of the match, so `mat` records that index.
+        let mut mat = None;
+        let mut i = at;
+        while i < haystack.len() {
+            sid = dfa.next_state(sid, haystack[i]);
+            if dfa.is_special_state(sid) {
+                if dfa.is_match_state(sid) {
+                    mat = Some(i);
+                } else if dfa.is_dead_state(sid) {
+                    return mat;
+                } else if dfa.is_quit_state(sid) {
+                    // A byte the DFA refuses to handle: `fancy_regex` decides.
+                    return None;
+                }
+            }
+            i += 1;
+        }
+        // End of the haystack: the alternatives may still match there.
+        if dfa.is_match_state(dfa.next_eoi_state(sid)) {
+            mat = Some(haystack.len());
+        }
+        mat
+    }
+}
+
+/// Splits `pattern` into its top-level alternatives.
+///
+/// Returns `None` for anything this deliberately simple scanner does not fully
+/// understand, in which case no fast path is built at all.
+fn top_level_alternatives(pattern: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut chars = pattern.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                // Skip the escaped character, whatever it is.
+                chars.next()?;
+            }
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => depth += 1,
+            ')' if !in_class => depth = depth.checked_sub(1)?,
+            '|' if !in_class && depth == 0 => {
+                parts.push(&pattern[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if in_class || depth != 0 {
+        return None;
+    }
+    parts.push(&pattern[start..]);
+    Some(parts)
+}
+
+/// Rewrites one top-level alternative into a form the `regex-automata` DFA
+/// compiler accepts, or returns `None` if the alternative uses a construct
+/// whose meaning is not a function of the text at the piece start alone.
+///
+/// The only rewrite is dropping possessive markers (`++`, `*+`, `?+`,
+/// `{m,n}+`), which `regex-automata` has no syntax for. A possessive
+/// quantifier differs from a greedy one only when the greedy one would
+/// backtrack, so this is not universally sound -- which is why the resulting
+/// DFA is only adopted after it is verified to split exactly like
+/// `fancy_regex` (see `SplitDfa::agrees_with`).
+fn plain_alternative(alt: &str) -> Option<String> {
+    let mut out = String::with_capacity(alt.len());
+    let mut chars = alt.chars().peekable();
+    let mut in_class = false;
+    // Whether the last thing written was a quantifier, so that a `+` following
+    // it is a possessive marker rather than a quantifier of its own.
+    let mut prev_quantifier = false;
+    while let Some(c) = chars.next() {
+        if in_class {
+            match c {
+                '\\' => {
+                    out.push(c);
+                    out.push(chars.next()?);
+                }
+                // Nested or POSIX classes, and class set operations, are not
+                // worth reasoning about here.
+                '[' | '&' | '~' => return None,
+                ']' => {
+                    in_class = false;
+                    out.push(c);
+                }
+                _ => out.push(c),
+            }
+            continue;
+        }
+        match c {
+            '\\' => {
+                let e = chars.next()?;
+                match e {
+                    // Assertions and references that depend on more than the
+                    // text at the piece start, or that `find_iter` handles
+                    // specially.
+                    'G' | 'K' | 'b' | 'B' | 'A' | 'z' | 'Z' | 'g' | 'k' => return None,
+                    // Back-references (and octal escapes).
+                    '0'..='9' => return None,
+                    _ => {}
+                }
+                out.push(c);
+                out.push(e);
+                prev_quantifier = false;
+            }
+            // Anchors make the piece depend on where the haystack ends.
+            '^' | '$' => return None,
+            '[' => {
+                in_class = true;
+                out.push(c);
+                prev_quantifier = false;
+            }
+            '(' => {
+                out.push(c);
+                if chars.peek() == Some(&'?') {
+                    out.push(chars.next()?);
+                    match chars.peek() {
+                        Some(':') => out.push(chars.next()?),
+                        // Inline flags, e.g. `(?i:...)`.
+                        Some(f) if f.is_ascii_alphabetic() || *f == '-' => {
+                            while let Some(f) = chars.peek() {
+                                if f.is_ascii_alphabetic() || *f == '-' {
+                                    out.push(chars.next()?);
+                                } else {
+                                    break;
+                                }
+                            }
+                            match chars.peek() {
+                                Some(':') | Some(')') => out.push(chars.next()?),
+                                _ => return None,
+                            }
+                        }
+                        // Look-around, capture group names, conditionals, ...
+                        _ => return None,
+                    }
+                }
+                prev_quantifier = false;
+            }
+            '{' => {
+                // A `{m,n}` repetition (only then is a following `+`
+                // possessive); anything else is a literal brace.
+                let mut rep = String::from('{');
+                let mut valid = false;
+                let mut digits = 0;
+                loop {
+                    match chars.peek() {
+                        Some(d) if d.is_ascii_digit() => {
+                            digits += 1;
+                            rep.push(chars.next()?);
+                        }
+                        Some(',') if digits > 0 => rep.push(chars.next()?),
+                        Some('}') if digits > 0 => {
+                            rep.push(chars.next()?);
+                            valid = true;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push_str(&rep);
+                prev_quantifier = valid;
+            }
+            '+' if prev_quantifier => prev_quantifier = false,
+            '+' | '*' | '?' => {
+                out.push(c);
+                prev_quantifier = true;
+            }
+            _ => {
+                out.push(c);
+                prev_quantifier = false;
+            }
+        }
+    }
+    if in_class {
+        return None;
+    }
+    Some(out)
+}
+
+/// Builds a DFA for the leading look-around-free alternatives of `pattern`, if
+/// it can be shown to split text exactly like `fancy_regex` does.
+fn build_split_dfa(pattern: &str, fancy: &Regex) -> Option<SplitDfa> {
+    // `find_iter` passes `\G`/`\K` state between matches; leave such patterns
+    // entirely alone.
+    if pattern.contains("\\G") || pattern.contains("\\K") {
+        return None;
+    }
+    let alternatives = top_level_alternatives(pattern)?;
+    // The fast alternatives must be a *prefix* of the alternation: only then
+    // does an ordered-alternation match of the DFA pick the same alternative
+    // the full pattern picks.
+    let mut plain = Vec::new();
+    for alt in &alternatives {
+        match plain_alternative(alt) {
+            Some(rewritten) => plain.push(rewritten),
+            None => break,
+        }
+    }
+    if plain.is_empty() {
+        return None;
+    }
+    let dfa = dense::Builder::new()
+        .configure(
+            dense::Config::new()
+                .match_kind(MatchKind::LeftmostFirst)
+                .start_kind(StartKind::Anchored)
+                .dfa_size_limit(Some(SPLIT_DFA_SIZE_LIMIT))
+                .determinize_size_limit(Some(SPLIT_DETERMINIZE_SIZE_LIMIT)),
+        )
+        .build(&plain.join("|"))
+        .ok()?;
+    let start = dfa.universal_start_state(Anchored::Yes)?;
+    let split = SplitDfa { dfa, start };
+    if !split.agrees_with(fancy) {
+        return None;
+    }
+    Some(split)
+}
+
+impl SplitDfa {
+    /// Checks that splitting with the DFA (falling back to `fancy_regex`)
+    /// yields exactly the pieces `fancy_regex` yields on its own, over a corpus
+    /// covering every kind of character the tokeniser patterns distinguish.
+    fn agrees_with(&self, fancy: &Regex) -> bool {
+        for probe in split_probes() {
+            let mut fast = Vec::new();
+            for piece in Pieces::new(&probe, self, fancy) {
+                match piece {
+                    Ok(piece) => fast.push(piece),
+                    Err(_) => return false,
+                }
+            }
+            let mut slow = Vec::new();
+            for mat in fancy.find_iter(&probe) {
+                match mat {
+                    Ok(mat) => slow.push(mat.as_str()),
+                    Err(_) => return false,
+                }
+            }
+            if fast != slow {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The corpus `SplitDfa::agrees_with` verifies against: every string of up to
+/// three characters over a spread of ASCII and non-ASCII characters (letters,
+/// digits, marks, spaces, line breaks, punctuation), every pair over a wider
+/// set, plus a handful of longer strings.
+fn split_probes() -> Vec<String> {
+    const TRIPLES: [&str; 10] = ["a", "Z", "0", " ", "\n", "'", ",", "é", "中", "\t"];
+    const PAIRS: [&str; 20] = [
+        "a", "Z", "0", " ", "\n", "'", ",", "é", "中", "\t", "\r", "s", "9", "\u{a0}", "½", "Ⅷ",
+        "０", "\u{301}", "!", "_",
+    ];
+    const LONGER: [&str; 24] = [
+        "",
+        " ",
+        "  ",
+        "   ",
+        "hello world",
+        "it's a test",
+        "I'LL DO IT",
+        "don't  stop",
+        "123 4567 89",
+        "a  b\n\nc",
+        "\r\n\r\n",
+        " \n \n ",
+        "\t\t x",
+        "trailing space ",
+        "trailing newline\n",
+        "café au lait",
+        "中文字符测试",
+        "🎉🎉 party",
+        "a\u{301}e\u{301}",
+        "０１２３",
+        "½Ⅷ¾",
+        "mixed 中文 and ASCII 123",
+        "\u{a0}nbsp\u{a0}",
+        "under_score-dash.dot!bang?",
+    ];
+
+    let mut probes = Vec::new();
+    for a in PAIRS {
+        probes.push(a.to_string());
+        for b in PAIRS {
+            probes.push(format!("{a}{b}"));
+        }
+    }
+    for a in TRIPLES {
+        for b in TRIPLES {
+            for c in TRIPLES {
+                probes.push(format!("{a}{b}{c}"));
+            }
+        }
+    }
+    probes.extend(LONGER.iter().map(|s| s.to_string()));
+    probes
+}
+
+/// Returns the smallest index of a valid UTF-8 sequence starting after `i`.
+/// Mirrors the equivalent helper in `fancy_regex`'s `Matches` iterator.
+fn next_utf8(text: &str, i: usize) -> usize {
+    match text.as_bytes().get(i) {
+        None => i + 1,
+        Some(&b) => {
+            i + match b {
+                0x00..=0x7F => 1,
+                0x80..=0xBF => 1,
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                _ => 4,
+            }
+        }
+    }
+}
+
+/// Iterator over the pieces of `text`, taking each piece from the DFA when it
+/// matches and from `fancy_regex` otherwise.
+///
+/// The piece stream is identical to `fancy_regex`'s `find_iter`, including its
+/// handling of empty matches and of positions where the pattern matches only
+/// further along.
+struct Pieces<'a> {
+    text: &'a str,
+    split: &'a SplitDfa,
+    fancy: &'a Regex,
+    pos: usize,
+    last_match: Option<usize>,
+}
+
+impl<'a> Pieces<'a> {
+    fn new(text: &'a str, split: &'a SplitDfa, fancy: &'a Regex) -> Self {
+        Pieces {
+            text,
+            split,
+            fancy,
+            pos: 0,
+            last_match: None,
+        }
+    }
+}
+
+impl<'a> Iterator for Pieces<'a> {
+    type Item = fancy_regex::Result<&'a str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.pos > self.text.len() {
+                return None;
+            }
+            if self.pos < self.text.len()
+                && let Some(end) = self.split.piece_end(self.text, self.pos)
+                && end > self.pos
+            {
+                let piece = &self.text[self.pos..end];
+                self.pos = end;
+                self.last_match = Some(end);
+                return Some(Ok(piece));
+            }
+            // The DFA's alternatives don't match here: `fancy_regex` decides.
+            let mat = match self.fancy.find_from_pos(self.text, self.pos) {
+                Ok(Some(mat)) => mat,
+                Ok(None) => {
+                    self.pos = self.text.len() + 1;
+                    return None;
+                }
+                Err(e) => {
+                    self.pos = self.text.len() + 1;
+                    return Some(Err(e));
+                }
+            };
+            if mat.start() == mat.end() {
+                self.pos = next_utf8(self.text, mat.end());
+                let after_match = self.last_match == Some(mat.end());
+                self.last_match = Some(mat.end());
+                // Don't accept an empty match immediately following a match.
+                if after_match {
+                    continue;
+                }
+            } else {
+                self.pos = mat.end();
+                self.last_match = Some(mat.end());
+            }
+            return Some(Ok(mat.as_str()));
+        }
+    }
+}
+
+/// The pieces of `text`, from either splitter.
+enum Split<'a> {
+    Fast(Pieces<'a>),
+    Fancy(fancy_regex::Matches<'a, 'a>),
+}
+
+impl<'a> Iterator for Split<'a> {
+    type Item = fancy_regex::Result<&'a str>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Split::Fast(pieces) => pieces.next(),
+            Split::Fancy(matches) => matches.next().map(|mat| mat.map(|mat| mat.as_str())),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodeKeyError {
     pub token: Rank,
@@ -331,10 +804,25 @@ pub struct CoreBPE {
     decoder_flat: Vec<Vec<u8>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
+    // Byte-level DFA for the split pattern's leading, look-around-free
+    // alternatives, which produce nearly every piece of real text. It is
+    // immutable and needs no scratch space, so unlike the `fancy_regex` copies
+    // above a single instance serves every thread. `None` when the pattern
+    // could not be shown to split identically (see `build_split_dfa`).
+    split_dfa: Option<Arc<SplitDfa>>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
 
 impl CoreBPE {
+    /// Iterator over the pieces of `text`, exactly as `fancy_regex`'s
+    /// `find_iter` on the split pattern would produce them.
+    fn split<'a>(&'a self, text: &'a str) -> Split<'a> {
+        match &self.split_dfa {
+            Some(split) => Split::Fast(Pieces::new(text, split, self._get_tl_regex())),
+            None => Split::Fancy(self._get_tl_regex().find_iter(text)),
+        }
+    }
+
     fn _get_tl_regex(&self) -> &Regex {
         // See performance notes above for what this is about
         // It's also a little janky, please make a better version of it!
@@ -378,10 +866,9 @@ impl CoreBPE {
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        for piece in self.split(text) {
+            let piece = piece.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -396,7 +883,6 @@ impl CoreBPE {
         allowed_special: &HashSet<&str>,
     ) -> Result<(Vec<Rank>, usize), EncodeError> {
         let special_regex = self._get_tl_special_regex();
-        let regex = self._get_tl_regex();
         let mut ret = vec![];
 
         let mut start = 0;
@@ -420,9 +906,9 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
+            for piece in self.split(&text[start..end]) {
+                let piece = match piece {
+                    Ok(piece) => piece.as_bytes(),
                     Err(e) => {
                         return Err(EncodeError {
                             message: format!("Regex error while tokenizing: {e}"),
@@ -430,7 +916,6 @@ impl CoreBPE {
                     }
                 };
 
-                let piece = mat.as_str().as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
                     ret.push(*token);
@@ -695,6 +1180,11 @@ impl CoreBPE {
             .map(|_| Regex::new(&special_pattern))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Compile the DFA for the split pattern's look-around-free leading
+        // alternatives. It is only adopted if it splits exactly like
+        // `fancy_regex`, so an unusual pattern simply keeps today's behaviour.
+        let split_dfa = build_split_dfa(pattern, &regex_tls[0]).map(Arc::new);
+
         Ok(Self {
             encoder,
             special_tokens_encoder,
@@ -703,6 +1193,7 @@ impl CoreBPE {
             decoder_flat,
             regex_tls,
             special_regex_tls,
+            split_dfa,
             sorted_token_bytes,
         })
     }
@@ -743,5 +1234,110 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PAT: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+
+    #[test]
+    fn test_top_level_alternatives() {
+        assert_eq!(
+            crate::top_level_alternatives(R50K_PAT).unwrap(),
+            vec![
+                r"'(?:[sdmt]|ll|ve|re)",
+                r" ?\p{L}++",
+                r" ?\p{N}++",
+                r" ?[^\s\p{L}\p{N}]++",
+                r"\s++$",
+                r"\s+(?!\S)",
+                r"\s",
+            ]
+        );
+        // `|` inside a group or a character class is not a top-level `|`.
+        assert_eq!(
+            crate::top_level_alternatives(r"a[|]|(b|c)|\|").unwrap(),
+            vec![r"a[|]", r"(b|c)", r"\|"]
+        );
+    }
+
+    #[test]
+    fn test_plain_alternative() {
+        // Possessive markers are dropped, everything else is kept verbatim.
+        assert_eq!(
+            crate::plain_alternative(r" ?[^\s\p{L}\p{N}]++[\r\n]*+").unwrap(),
+            r" ?[^\s\p{L}\p{N}]+[\r\n]*"
+        );
+        assert_eq!(
+            crate::plain_alternative(r"\p{N}{1,3}+").unwrap(),
+            r"\p{N}{1,3}"
+        );
+        assert_eq!(
+            crate::plain_alternative(r"'(?i:[sdmt]|ll|ve|re)").unwrap(),
+            r"'(?i:[sdmt]|ll|ve|re)"
+        );
+        // A `+` after a literal brace is a quantifier, not a possessive marker.
+        assert_eq!(crate::plain_alternative(r"a}+").unwrap(), r"a}+");
+        // Constructs that don't depend on the piece start alone are rejected.
+        assert!(crate::plain_alternative(r"\s+(?!\S)").is_none());
+        assert!(crate::plain_alternative(r"\s++$").is_none());
+        assert!(crate::plain_alternative(r"^\s+").is_none());
+        assert!(crate::plain_alternative(r"\bword").is_none());
+        assert!(crate::plain_alternative(r"(a)\1").is_none());
+        assert!(crate::plain_alternative(r"(?<=a)b").is_none());
+    }
+
+    #[test]
+    fn test_split_dfa_matches_fancy_regex() {
+        for pattern in [R50K_PAT, CL100K_PAT] {
+            let fancy = Regex::new(pattern).unwrap();
+            // Built at all (the leading alternatives are look-around-free) and
+            // verified against `fancy_regex` over the probe corpus.
+            let split = crate::build_split_dfa(pattern, &fancy).expect("fast path");
+            // The leading alternatives are covered, the look-around ones are not.
+            assert_eq!(split.piece_end(" the", 0), Some(4));
+            assert_eq!(split.piece_end("  a", 0), None);
+        }
+    }
+
+    #[test]
+    fn test_piece_end_matches_regex_automata_search() {
+        use regex_automata::{Anchored, Input, dfa::Automaton};
+
+        for pattern in [R50K_PAT, CL100K_PAT] {
+            let fancy = Regex::new(pattern).unwrap();
+            let split = crate::build_split_dfa(pattern, &fancy).expect("fast path");
+            for probe in crate::split_probes() {
+                for at in 0..=probe.len() {
+                    if !probe.is_char_boundary(at) {
+                        continue;
+                    }
+                    let input = Input::new(probe.as_str())
+                        .span(at..probe.len())
+                        .anchored(Anchored::Yes);
+                    let expected = match split.dfa.try_search_fwd(&input) {
+                        Ok(m) => m.map(|m| m.offset()),
+                        Err(_) => None,
+                    };
+                    assert_eq!(
+                        split.piece_end(&probe, at),
+                        expected,
+                        "pattern {pattern:?}, probe {probe:?} at {at}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_split_dfa_rejects_unsupported_patterns() {
+        // A pattern whose *first* alternative needs look-around gets no DFA.
+        let pattern = r"\s+(?!\S)| ?\p{L}+";
+        let fancy = Regex::new(pattern).unwrap();
+        assert!(crate::build_split_dfa(pattern, &fancy).is_none());
+        // Neither does one using `\G`, which `find_iter` treats specially.
+        let pattern = r"\G ?\p{L}+|\s";
+        let fancy = Regex::new(pattern).unwrap();
+        assert!(crate::build_split_dfa(pattern, &fancy).is_none());
     }
 }
