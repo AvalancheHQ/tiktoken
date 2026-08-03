@@ -199,6 +199,35 @@ impl CoreBPE {
         }
     }
 
+    /// Decodes tokens into bytes plus the character offset of every token.
+    ///
+    /// Doing the whole sequence in one call keeps the per-token work (token
+    /// lookup, continuation-byte counting, concatenation) in Rust instead of
+    /// paying a Python-level call and a `bytes` object per token.
+    #[pyo3(name = "decode_bytes_with_offsets")]
+    fn py_decode_bytes_with_offsets(
+        &self,
+        py: Python,
+        tokens: &Bound<'_, PyAny>,
+    ) -> PyResult<(Py<PyBytes>, Vec<usize>)> {
+        // Read a concrete `list` with the `PyList` iterator, as `decode_bytes`
+        // does: pyo3's generic sequence extraction goes through `PyIterator`
+        // and costs more per token than the decode itself.
+        let tokens: Vec<Rank> = if let Ok(list) = tokens.downcast::<PyList>() {
+            let mut tokens = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                tokens.push(read_rank(&item)?);
+            }
+            tokens
+        } else {
+            tokens.extract()?
+        };
+        match py.detach(|| self.decode_bytes_with_offsets(&tokens)) {
+            Ok((bytes, offsets)) => Ok((PyBytes::new(py, &bytes).into(), offsets)),
+            Err(e) => Err(pyo3::exceptions::PyKeyError::new_err(format!("{}", e))),
+        }
+    }
+
     fn decode_single_token_bytes(&self, py: Python, token: Rank) -> PyResult<Py<PyBytes>> {
         if let Some(bytes) = self.decoder.get(&token) {
             return Ok(PyBytes::new(py, bytes).into());

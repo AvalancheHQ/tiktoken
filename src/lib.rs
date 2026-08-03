@@ -375,6 +375,42 @@ impl CoreBPE {
         Ok(ret)
     }
 
+    /// Decodes tokens into bytes, and for each token the character offset at
+    /// which it starts in the decoded text.
+    ///
+    /// Offsets count characters, not bytes. A token whose first byte is a UTF-8
+    /// continuation byte starts in the middle of a character, and is reported at
+    /// the offset of that character, i.e. one before the characters decoded so
+    /// far. This is the same rule the caller of this used to apply in Python,
+    /// one `decode_single_token_bytes` call per token.
+    pub(crate) fn decode_bytes_with_offsets(
+        &self,
+        tokens: &[Rank],
+    ) -> Result<(Vec<u8>, Vec<usize>), DecodeKeyError> {
+        #[inline]
+        fn is_continuation(byte: u8) -> bool {
+            byte & 0xc0 == 0x80
+        }
+
+        let mut bytes = Vec::with_capacity(tokens.len() * 2);
+        let mut offsets = Vec::with_capacity(tokens.len());
+        // Characters decoded so far, i.e. bytes that are not continuations.
+        let mut text_len = 0usize;
+        for &token in tokens {
+            let token_bytes = self.token_bytes(token).ok_or(DecodeKeyError { token })?;
+            let starts_mid_character = token_bytes
+                .first()
+                .is_some_and(|&byte| is_continuation(byte));
+            offsets.push(text_len - usize::from(starts_mid_character && text_len > 0));
+            text_len += token_bytes
+                .iter()
+                .filter(|&&byte| !is_continuation(byte))
+                .count();
+            bytes.extend_from_slice(token_bytes);
+        }
+        Ok((bytes, offsets))
+    }
+
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)

@@ -83,6 +83,22 @@ def test_decode(benchmark, encoding_name: str, size: str) -> None:
 
 
 @pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
+@pytest.mark.parametrize("size", list(TEXT_SIZES))
+def test_decode_with_offsets(benchmark, encoding_name: str, size: str) -> None:
+    """Decoding tokens together with the character offset of each token.
+
+    This is the API used to line tokens up with the text they came from (token
+    highlighting, logprob alignment, ...), so it is decoded on the same inputs
+    as ``test_decode``.
+    """
+    enc = _get_encoding(encoding_name)
+    tokens = enc.encode_ordinary(TEXT_SIZES[size])
+    text, offsets = benchmark(enc.decode_with_offsets, tokens)
+    assert text
+    assert len(offsets) == len(tokens)
+
+
+@pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
 def test_encode_ordinary_batch(benchmark, encoding_name: str) -> None:
     enc = _get_encoding(encoding_name)
     documents = [TEXT_SIZES["medium"]] * 64
