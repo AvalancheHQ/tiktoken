@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use pyo3::{
     IntoPyObjectExt, PyResult, exceptions,
+    marker::Ungil,
     prelude::*,
     pybacked::PyBackedStr,
     types::{PyBytes, PyList},
@@ -9,6 +10,37 @@ use pyo3::{
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{CoreBPE, Rank, byte_pair_encode};
+
+/// Number of input bytes from which an encode releases the GIL.
+///
+/// Releasing the GIL is not free: `Python::detach` pays a GIL release, a GIL
+/// re-acquire and the thread-state bookkeeping around both, a fixed cost per
+/// call that does not shrink with the input. Tokenising a short string is
+/// itself only tens of microseconds, so on small inputs that round trip is a
+/// measurable share of the call while buying no useful concurrency — the work
+/// it lets other threads overlap with is over before they could be scheduled.
+///
+/// From this threshold on, the tokenising work dominates the round trip, so the
+/// GIL is released exactly as before and multi-threaded/batch encoding of real
+/// documents keeps overlapping. The threshold is deliberately small: a kilobyte
+/// of text is tokenised in well under CPython's 5 ms thread switch interval, so
+/// holding the GIL for it is no different from any other C call.
+const DETACH_MIN_INPUT_LEN: usize = 1024;
+
+/// Runs `f` with the GIL released, unless `input_len` is small enough that the
+/// release would cost more than it saves (see [`DETACH_MIN_INPUT_LEN`]).
+#[inline]
+fn detach_if_worthwhile<T, F>(py: Python<'_>, input_len: usize, f: F) -> T
+where
+    F: Ungil + FnOnce() -> T,
+    T: Ungil,
+{
+    if input_len >= DETACH_MIN_INPUT_LEN {
+        py.detach(f)
+    } else {
+        f()
+    }
+}
 
 #[pymethods]
 impl CoreBPE {
@@ -28,7 +60,7 @@ impl CoreBPE {
 
     #[pyo3(name = "encode_ordinary")]
     fn py_encode_ordinary(&self, py: Python, text: &str) -> Vec<Rank> {
-        py.detach(|| self.encode_ordinary(text))
+        detach_if_worthwhile(py, text.len(), || self.encode_ordinary(text))
     }
 
     #[pyo3(name = "encode")]
@@ -38,7 +70,7 @@ impl CoreBPE {
         text: &str,
         allowed_special: HashSet<PyBackedStr>,
     ) -> PyResult<Vec<Rank>> {
-        py.detach(|| {
+        detach_if_worthwhile(py, text.len(), || {
             let allowed_special: HashSet<&str> =
                 allowed_special.iter().map(|s| s.as_ref()).collect();
             match self.encode(text, &allowed_special) {
@@ -54,7 +86,7 @@ impl CoreBPE {
         text: &str,
         allowed_special: HashSet<PyBackedStr>,
     ) -> PyResult<Py<PyAny>> {
-        let tokens_res = py.detach(|| {
+        let tokens_res = detach_if_worthwhile(py, text.len(), || {
             let allowed_special: HashSet<&str> =
                 allowed_special.iter().map(|s| s.as_ref()).collect();
             self.encode(text, &allowed_special)
@@ -70,7 +102,7 @@ impl CoreBPE {
     }
 
     fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<Rank> {
-        py.detach(|| {
+        detach_if_worthwhile(py, bytes.len(), || {
             match std::str::from_utf8(bytes) {
                 // Straightforward case
                 Ok(text) => self.encode_ordinary(text),
