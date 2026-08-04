@@ -42,16 +42,29 @@ _PARAGRAPH = (
 )
 
 
-def _make_text(target_len: int) -> str:
-    text = _PARAGRAPH * (target_len // len(_PARAGRAPH) + 1)
+# The same content in Chinese. Text without spaces makes the tokeniser split
+# emit long pieces (tens of bytes instead of a handful), so the BPE merges,
+# rather than the split, dominate encoding.
+_CJK_PARAGRAPH = (
+    "字节对编码是一种把文本转换成词元的方法。"
+    "它可以逆向还原而不丢失信息，适用于任意文本，"
+    "并且会压缩输入，使词元序列比原始字节更短。"
+    "语言模型看到的是一串数字，也就是词元，而不是原始文本。"
+)
+
+
+def _make_text(target_len: int, paragraph: str = _PARAGRAPH) -> str:
+    text = paragraph * (target_len // len(paragraph) + 1)
     return text[:target_len]
 
 
-# Small (~1 line), medium (~2 KB) and large (~64 KB) documents.
+# Small (~1 line), medium (~2 KB) and large (~64 KB) documents, plus a
+# non-ASCII (~2 KB) document.
 TEXT_SIZES = {
     "small": _make_text(64),
     "medium": _make_text(2_048),
     "large": _make_text(65_536),
+    "cjk": _make_text(2_048, _CJK_PARAGRAPH),
 }
 
 

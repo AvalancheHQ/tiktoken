@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::thread;
 
 use fancy_regex::Regex;
@@ -138,9 +139,21 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
 }
 
 fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
+    let mut parts = Vec::with_capacity(piece.len() + 1);
+    _byte_pair_merge_into(ranks, piece, &mut parts);
+    parts
+}
+
+/// Same as `_byte_pair_merge`, but filling a caller-owned buffer so it can be
+/// reused across the parts of one piece.
+fn _byte_pair_merge_into(
+    ranks: &HashMap<Vec<u8>, Rank>,
+    piece: &[u8],
+    parts: &mut Vec<(usize, Rank)>,
+) {
     // This is a vector of (start, rank).
     // The rank is of the pair starting at position start.
-    let mut parts = Vec::with_capacity(piece.len() + 1);
+    parts.clear();
 
     // Note that we hash bytes when indexing into `ranks`, not token pairs. As long as we train BPE
     // the way we currently do, this is equivalent. An easy way to break this would be to decouple
@@ -158,7 +171,7 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
 
     let get_rank = {
         #[inline(always)]
-        |parts: &Vec<(usize, Rank)>, i: usize| {
+        |parts: &[(usize, Rank)], i: usize| {
             if (i + 3) < parts.len() {
                 // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
                 // parts[i + 1], see comment in the main loop.
@@ -180,9 +193,9 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
         // Update parts[i] and parts[i - 1] before removing parts[i + 1], since
         // `parts.remove(i + 1)` will thrash the cache.
         if i > 0 {
-            parts[i - 1].1 = get_rank(&parts, i - 1);
+            parts[i - 1].1 = get_rank(parts, i - 1);
         }
-        parts[i].1 = get_rank(&parts, i);
+        parts[i].1 = get_rank(parts, i);
         parts.remove(i + 1);
 
         min_rank = (Rank::MAX, usize::MAX);
@@ -192,7 +205,6 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
             }
         }
     }
-    parts
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
@@ -208,6 +220,97 @@ pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Ran
             .collect();
     }
     _byte_pair_merge_large(ranks, piece)
+}
+
+/// The set of byte pairs that occur inside some vocabulary token.
+///
+/// A merge only ever produces a token that is in the vocabulary, so a merged
+/// token contains every byte pair it spans. If a byte pair does not occur in
+/// any token, no merge can ever span the position between those two bytes: the
+/// piece can be cut there and the parts encoded independently.
+struct MergeablePairs {
+    // One bit per (first byte, second byte) combination, 65536 bits. Boxed as a
+    // fixed-size array so the index derived from a byte pair is provably in
+    // bounds and needs no check.
+    bits: Box<[u64; (1 << 16) / 64]>,
+}
+
+impl MergeablePairs {
+    fn new<'a>(tokens: impl IntoIterator<Item = &'a Vec<u8>>) -> Self {
+        let mut bits = Box::new([0u64; (1 << 16) / 64]);
+        for token in tokens {
+            for pair in token.windows(2) {
+                let index = Self::index(pair[0], pair[1]);
+                bits[index >> 6] |= 1u64 << (index & 63);
+            }
+        }
+        Self { bits }
+    }
+
+    #[inline(always)]
+    fn index(first: u8, second: u8) -> usize {
+        ((first as usize) << 8) | second as usize
+    }
+
+    #[inline(always)]
+    fn contains(&self, first: u8, second: u8) -> bool {
+        let index = Self::index(first, second);
+        self.bits[index >> 6] & (1u64 << (index & 63)) != 0
+    }
+}
+
+/// Same as `byte_pair_encode`, but cutting the piece at the positions no
+/// vocabulary token can span before running the merges.
+///
+/// The result is exactly `byte_pair_encode(piece, ranks)`: no merge crosses a
+/// cut, so the parts are independent. The merge loop is quadratic in the number
+/// of parts, so cutting keeps it cheap on long pieces — text written without
+/// spaces (Chinese, Japanese, Thai, …) produces pieces tens of bytes long.
+fn byte_pair_encode_cut(
+    piece: &[u8],
+    ranks: &HashMap<Vec<u8>, Rank>,
+    pairs: &MergeablePairs,
+) -> Vec<Rank> {
+    let mut out = Vec::with_capacity(piece.len());
+    // One merge buffer, reused by every part of this piece.
+    let mut parts = Vec::with_capacity(piece.len() + 1);
+    let mut start = 0;
+    for i in 1..piece.len() {
+        if !pairs.contains(piece[i - 1], piece[i]) {
+            append_part(&piece[start..i], ranks, &mut parts, &mut out);
+            start = i;
+        }
+    }
+    append_part(&piece[start..], ranks, &mut parts, &mut out);
+    out
+}
+
+/// Merges one part of a piece, appending its tokens to `out`.
+///
+/// This mirrors `byte_pair_encode` exactly — in particular it does *not* short
+/// circuit when the whole part is a token, since the merges do not necessarily
+/// build that token.
+#[inline]
+fn append_part(
+    part: &[u8],
+    ranks: &HashMap<Vec<u8>, Rank>,
+    parts: &mut Vec<(usize, Rank)>,
+    out: &mut Vec<Rank>,
+) {
+    if part.len() == 1 {
+        out.push(ranks[part]);
+        return;
+    }
+    if part.len() < 100 {
+        _byte_pair_merge_into(ranks, part, parts);
+        out.extend(
+            parts
+                .windows(2)
+                .map(|bounds| ranks[&part[bounds[0].0..bounds[1].0]]),
+        );
+        return;
+    }
+    out.extend(&_byte_pair_merge_large(ranks, part));
 }
 
 pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<&'a [u8]> {
@@ -329,6 +432,9 @@ pub struct CoreBPE {
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
     decoder_flat: Vec<Vec<u8>>,
+    // Byte pairs that occur inside some token, used to cut a piece into
+    // independently mergeable parts before running BPE on it.
+    mergeable_pairs: Arc<MergeablePairs>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
@@ -375,6 +481,11 @@ impl CoreBPE {
         Ok(ret)
     }
 
+    /// `byte_pair_encode` for a piece of this tokeniser's vocabulary.
+    fn byte_pair_encode_piece(&self, piece: &[u8]) -> Vec<Rank> {
+        byte_pair_encode_cut(piece, &self.encoder, &self.mergeable_pairs)
+    }
+
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
@@ -384,7 +495,7 @@ impl CoreBPE {
             let piece = mat.unwrap().as_str().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+                None => ret.extend(&self.byte_pair_encode_piece(piece)),
             }
         }
         ret
@@ -436,7 +547,7 @@ impl CoreBPE {
                     ret.push(*token);
                     continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
+                let tokens = self.byte_pair_encode_piece(piece);
                 last_piece_token_len = tokens.len();
                 ret.extend(&tokens);
             }
@@ -679,6 +790,8 @@ impl CoreBPE {
             None => Vec::new(),
         };
 
+        let mergeable_pairs = Arc::new(MergeablePairs::new(encoder.keys()));
+
         // Clone because I don't know how to tell Rust I'm not going to change the map
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
@@ -701,6 +814,7 @@ impl CoreBPE {
             decoder,
             special_tokens_decoder,
             decoder_flat,
+            mergeable_pairs,
             regex_tls,
             special_regex_tls,
             sorted_token_bytes,
@@ -725,10 +839,62 @@ mod tests {
     use fancy_regex::Regex;
     use rustc_hash::FxHashMap as HashMap;
 
-    use crate::{Rank, byte_pair_split};
+    use crate::{MergeablePairs, Rank, byte_pair_encode, byte_pair_encode_cut, byte_pair_split};
 
     fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
         HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
+    }
+
+    /// Cutting a piece at the positions no token can span must not change what
+    /// the merges produce.
+    #[test]
+    fn test_cut_pieces_match_byte_pair_encode() {
+        // Every single byte is a token, plus a handful of multi-byte tokens, so
+        // some byte pairs are mergeable and some are not.
+        let mut ranks: HashMap<Vec<u8>, Rank> = HashMap::default();
+        for byte in 0u8..=255 {
+            ranks.insert(vec![byte], byte as Rank);
+        }
+        for (i, token) in [
+            &b"ab"[..],
+            b"abc",
+            b"abcd",
+            b"cd",
+            b"cde",
+            b"xy",
+            b"xyz",
+            b"zab",
+            b"\xe4\xb8",
+            b"\xe4\xb8\xad",
+            b"\xe4\xb8\xad\xe6\x96",
+        ]
+        .iter()
+        .enumerate()
+        {
+            ranks.insert(token.to_vec(), 256 + i as Rank);
+        }
+        let pairs = MergeablePairs::new(ranks.keys());
+
+        // A deterministic pseudo-random walk over the interesting alphabet.
+        let alphabet = b"abcdefxyz\xe4\xb8\xad\xe6\x96\x87";
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for len in 1..40usize {
+            for _ in 0..200 {
+                let piece: Vec<u8> = (0..len)
+                    .map(|_| {
+                        seed = seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        alphabet[(seed >> 33) as usize % alphabet.len()]
+                    })
+                    .collect();
+                assert_eq!(
+                    byte_pair_encode_cut(&piece, &ranks, &pairs),
+                    byte_pair_encode(&piece, &ranks),
+                    "piece: {piece:?}"
+                );
+            }
+        }
     }
 
     #[test]
