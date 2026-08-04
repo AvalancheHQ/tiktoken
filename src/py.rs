@@ -156,10 +156,17 @@ impl CoreBPE {
     #[pyo3(name = "decode_bytes")]
     fn py_decode_bytes(&self, py: Python, tokens: &Bound<'_, PyAny>) -> Result<Py<PyBytes>, PyErr> {
         // Fast path for the common case where `tokens` is a concrete `list`:
-        // resolve every token to its byte slice, then copy those bytes exactly
-        // once, straight into the destination Python `bytes` object. Avoiding
-        // the intermediate `Vec<Rank>` and `Vec<u8>` (i.e. that single copy) is
-        // the win, not the traversal count — this still walks the tokens twice.
+        // append every token's bytes straight into the destination Python
+        // `bytes` object in a single streaming pass, growing the object when it
+        // runs out of room and trimming it to the exact length at the end.
+        //
+        // The previous shape of this fast path had to know the total decoded
+        // length before it could allocate the `bytes` object, which forced it to
+        // walk the tokens once to resolve and total them, remembering a `&[u8]`
+        // per token (16 bytes each — ~224 KB of scratch for a 64 KB document)
+        // just to hand the slices to the copy pass. Streaming removes that
+        // scratch buffer, and with it the memory traffic of writing it and
+        // reading it back, without resolving any token twice.
         //
         // Note: unlike the non-`list` path, this holds the GIL for the whole
         // decode because it reads Python list items throughout. That is the
@@ -167,9 +174,11 @@ impl CoreBPE {
         // `py.detach` does, so multi-threaded decoding on a GIL build won't
         // overlap here.
         if let Ok(list) = tokens.downcast::<PyList>() {
-            // Resolve every token to its byte slice and accumulate total length.
-            let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
-            let mut total_len = 0usize;
+            // Tokens decode to about four bytes each on natural-language text,
+            // so this sizes the buffer in one shot for text-like input; anything
+            // denser grows geometrically, and the buffer is trimmed to the exact
+            // length once at the end.
+            let mut buf = BytesBuf::with_capacity(py, list.len().saturating_mul(5))?;
             for item in list.iter() {
                 let token = read_rank(&item)?;
                 let token_bytes = self.token_bytes(token).ok_or_else(|| {
@@ -177,18 +186,9 @@ impl CoreBPE {
                         "Invalid token for decoding: {token}"
                     ))
                 })?;
-                total_len += token_bytes.len();
-                slices.push(token_bytes);
+                buf.extend_from_slice(token_bytes)?;
             }
-            // Copy the resolved bytes directly into the final buffer.
-            let bytes = PyBytes::new_with(py, total_len, |mut buf| {
-                for s in &slices {
-                    buf[..s.len()].copy_from_slice(s);
-                    buf = &mut buf[s.len()..];
-                }
-                Ok(())
-            })?;
-            return Ok(bytes.into());
+            return buf.finish();
         }
 
         // Non-`list` inputs keep the original generic extraction path.
@@ -218,6 +218,118 @@ impl CoreBPE {
             .iter()
             .map(|x| PyBytes::new(py, x).into())
             .collect()
+    }
+}
+
+/// A Python `bytes` object being filled in place.
+///
+/// Owns a `bytes` object that nothing else references yet, so bytes can be
+/// appended straight into it, the object grown with `_PyBytes_Resize` when it
+/// runs out of room, and finally trimmed to the exact number of bytes written.
+/// The caller therefore never has to know the total length up front, and so does
+/// not have to remember anything per token. `Drop` releases the object if the
+/// decode returns early (an invalid token, say).
+///
+/// This is the same shape as CPython 3.15's own `PyBytesWriter`, spelled out
+/// here so it works on the Python versions tiktoken supports.
+struct BytesBuf<'py> {
+    py: Python<'py>,
+    /// Owned, non-null `bytes` object with a refcount of exactly one.
+    obj: *mut pyo3::ffi::PyObject,
+    /// Start of `obj`'s writable buffer, cached to keep the append path free of
+    /// Python calls. Refreshed whenever `obj` is reallocated.
+    data: *mut u8,
+    /// Bytes written so far; always `<= capacity`.
+    len: usize,
+    /// Allocated size of `obj`.
+    capacity: usize,
+}
+
+impl<'py> BytesBuf<'py> {
+    fn with_capacity(py: Python<'py>, capacity: usize) -> PyResult<Self> {
+        // SAFETY: a null data pointer asks CPython for an uninitialised buffer
+        // of the given size, which we then fill (and trim) ourselves.
+        let obj = unsafe {
+            pyo3::ffi::PyBytes_FromStringAndSize(
+                std::ptr::null(),
+                capacity as pyo3::ffi::Py_ssize_t,
+            )
+        };
+        if obj.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        // SAFETY: `obj` is a valid `bytes` object.
+        let data = unsafe { pyo3::ffi::PyBytes_AS_STRING(obj).cast::<u8>().cast_mut() };
+        Ok(Self {
+            py,
+            obj,
+            data,
+            len: 0,
+            capacity,
+        })
+    }
+
+    #[inline]
+    fn extend_from_slice(&mut self, bytes: &[u8]) -> PyResult<()> {
+        if bytes.len() > self.capacity - self.len {
+            self.grow(self.len + bytes.len())?;
+        }
+        // SAFETY: `data` is valid for `capacity` bytes and the check above
+        // guarantees `len + bytes.len() <= capacity`. The source cannot alias
+        // the destination: it borrows the tokeniser's vocabulary, not the
+        // freshly allocated `bytes` object.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(self.len), bytes.len());
+        }
+        self.len += bytes.len();
+        Ok(())
+    }
+
+    #[cold]
+    fn grow(&mut self, needed: usize) -> PyResult<()> {
+        self.resize(needed.max(self.capacity + self.capacity / 2))
+    }
+
+    fn resize(&mut self, capacity: usize) -> PyResult<()> {
+        // SAFETY: `obj` is a uniquely referenced `bytes` object, which is what
+        // `_PyBytes_Resize` requires; it replaces the pointer on success and
+        // clears it on failure.
+        let res =
+            unsafe { pyo3::ffi::_PyBytes_Resize(&mut self.obj, capacity as pyo3::ffi::Py_ssize_t) };
+        if res != 0 || self.obj.is_null() {
+            // `_PyBytes_Resize` already released the old object.
+            self.obj = std::ptr::null_mut();
+            self.data = std::ptr::null_mut();
+            return Err(PyErr::fetch(self.py));
+        }
+        // SAFETY: `obj` is a valid `bytes` object.
+        self.data = unsafe {
+            pyo3::ffi::PyBytes_AS_STRING(self.obj)
+                .cast::<u8>()
+                .cast_mut()
+        };
+        self.capacity = capacity;
+        Ok(())
+    }
+
+    /// Trims the object to the bytes actually written and hands over ownership.
+    fn finish(mut self) -> PyResult<Py<PyBytes>> {
+        if self.len != self.capacity {
+            self.resize(self.len)?;
+        }
+        let obj = std::mem::replace(&mut self.obj, std::ptr::null_mut());
+        // SAFETY: `obj` is an owned reference to a `bytes` object, and we no
+        // longer touch it (`Drop` sees a null pointer).
+        let bytes: Bound<'py, PyBytes> =
+            unsafe { Bound::from_owned_ptr(self.py, obj).cast_into_unchecked() };
+        Ok(bytes.unbind())
+    }
+}
+
+impl Drop for BytesBuf<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `obj` is either null or an owned reference we still hold.
+        unsafe { pyo3::ffi::Py_XDECREF(self.obj) }
     }
 }
 
