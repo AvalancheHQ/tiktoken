@@ -167,8 +167,15 @@ impl CoreBPE {
         // `py.detach` does, so multi-threaded decoding on a GIL build won't
         // overlap here.
         if let Ok(list) = tokens.downcast::<PyList>() {
-            // Resolve every token to its byte slice and accumulate total length.
-            let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
+            // The loop below is memory-bound, and its largest source of traffic
+            // is the scratch buffer that carries the first pass' result over to
+            // the copy pass. Carry the *token ids* (4 bytes each) rather than
+            // the resolved byte slices (16 bytes each): the buffer, which is
+            // written once and read back once, shrinks 4x. Re-resolving a token
+            // in the copy pass costs a single indexed load from the decode
+            // table, and a document only ever touches a small, hot subset of
+            // that table, so the re-lookups stay in cache.
+            let mut ids: Vec<Rank> = Vec::with_capacity(list.len());
             let mut total_len = 0usize;
             for item in list.iter() {
                 let token = read_rank(&item)?;
@@ -178,11 +185,13 @@ impl CoreBPE {
                     ))
                 })?;
                 total_len += token_bytes.len();
-                slices.push(token_bytes);
+                ids.push(token);
             }
-            // Copy the resolved bytes directly into the final buffer.
+            // Copy the resolved bytes directly into the final buffer. Every id
+            // was validated above, so `token_bytes` cannot miss here.
             let bytes = PyBytes::new_with(py, total_len, |mut buf| {
-                for s in &slices {
+                for &token in &ids {
+                    let s = self.token_bytes(token).unwrap_or_default();
                     buf[..s.len()].copy_from_slice(s);
                     buf = &mut buf[s.len()..];
                 }
