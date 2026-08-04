@@ -20,7 +20,23 @@ pyo3 = { version = "0.28.3", default-features = false, features = [
 ], optional = true }
 
 # tiktoken dependencies
-fancy-regex = "0.17.0"
+#
+# `fancy-regex` is built without its `std` feature: the only thing that feature adds to the
+# matching path is the `OPTION_TRACE` debug tracing, which is compiled in unconditionally and
+# tested at runtime on *every* executed VM instruction, on every capture save and on every
+# backtrack-stack push/pop. tiktoken never turns that flag on, so the tests are dead work in the
+# tokeniser split's hottest loop; dropping the feature compiles them out. Everything else the
+# feature controls is either parse-time (`HashMap` vs `BTreeMap` for named groups) or the
+# `std::error::Error` impl on its error type, which `CoreBPE::new` maps to a message instead.
+#
+# Note this does *not* put `regex-automata` (which runs the delegated automaton searches, and
+# whose thread-local scratch pool has a `std`-only fast path) into no-std mode: the `regex`
+# dependency below keeps `regex-automata/std` enabled through Cargo's feature unification.
+fancy-regex = { version = "0.17.0", default-features = false, features = [
+    "unicode",
+    "perf",
+    "variable-lookbehinds",
+] }
 regex = "1.10.3"
 rustc-hash = "2"
 bstr = "1.5.0"
