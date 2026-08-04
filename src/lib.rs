@@ -259,6 +259,55 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
+// The split patterns tiktoken ships mark every quantifier of a branch possessive
+// on its own: cl100k's letter branch is `[^\r\n\p{L}\p{N}]?+\p{L}++`, r50k's is
+// ` ?\p{L}++`. `fancy_regex` compiles each possessive quantifier into its own
+// atomic group, and an atomic group is a "hard" construct: the branch cannot be
+// handed to the automaton as a whole. Instead the backtracking VM runs, per
+// piece, one `BeginAtomic`/`EndAtomic` frame per quantifier (three save/restore
+// slots each, growing the VM's undo vectors) and one anchored `regex-automata`
+// delegate search per lookaround-free fragment between them.
+//
+// Sharing a *single* atomic group across the whole branch removes that split:
+// the branch body becomes one lookaround-free fragment (one delegate search),
+// wrapped in one atomic frame. Nothing about the branch's semantics changes —
+// it still cannot backtrack once it has matched.
+//
+// This is only sound when the classes involved are disjoint, because the merged
+// group does allow backtracking *inside* itself. Here the optional prefix and
+// the quantified body never accept the same byte (cl100k's
+// `[^\r\n\p{L}\p{N}]` excludes letters, r50k's prefix is a space and a space is
+// not a letter, a digit, or a `[^\s\p{L}\p{N}]`), so no internal backtrack can
+// ever rescue a failing branch: the rewritten branch matches exactly the same
+// text at exactly the same positions. Because that argument is specific to
+// these patterns, the rewrite is only applied to the exact pattern strings
+// tiktoken ships (see `tests::rewritten_patterns_split_identically`); any other
+// pattern, including `o200k_base`, is compiled verbatim.
+const SPLIT_PATTERN_REWRITES: [(&str, &str); 2] = [
+    // r50k_base / p50k_base / gpt2
+    (
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s",
+        r"'(?:[sdmt]|ll|ve|re)|(?> ?\p{L}+)|(?> ?\p{N}+)|(?> ?[^\s\p{L}\p{N}]+)|\s++$|\s+(?!\S)|\s",
+    ),
+    // cl100k_base
+    (
+        r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s",
+        r"'(?i:[sdmt]|ll|ve|re)|(?>[^\r\n\p{L}\p{N}]?\p{L}+)|\p{N}{1,3}+|(?> ?[^\s\p{L}\p{N}]+[\r\n]*)|\s++$|\s*[\r\n]|\s+(?!\S)|\s",
+    ),
+];
+
+/// Returns the pattern to compile the tokeniser split from: an equivalent form
+/// that is cheaper for `fancy_regex` to run when we recognise the pattern, and
+/// the pattern itself otherwise. See `SPLIT_PATTERN_REWRITES`.
+fn split_pattern_to_compile(pattern: &str) -> &str {
+    for (original, rewritten) in SPLIT_PATTERN_REWRITES {
+        if pattern == original {
+            return rewritten;
+        }
+    }
+    pattern
+}
+
 struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -688,8 +737,9 @@ impl CoreBPE {
         // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
         // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
         // lock-free path), paying the compile cost once at construction rather than on the hot path.
+        let split_pattern = split_pattern_to_compile(pattern);
         let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
+            .map(|_| Regex::new(split_pattern))
             .collect::<Result<Vec<_>, _>>()?;
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
@@ -743,5 +793,71 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    /// Every pattern we rewrite for `fancy_regex` must split text exactly like
+    /// the pattern it replaces, so the tokeniser is unaffected.
+    #[test]
+    fn rewritten_patterns_split_identically() {
+        // Cases that exercise every branch of both patterns and the boundaries
+        // between them: contractions (including uppercase, and a letter right
+        // after one), leading punctuation, digit runs longer than three, symbol
+        // runs followed by newlines, whitespace runs before and at the end of
+        // the text, CRLF, tabs, non-ASCII letters, digits and symbols, combining
+        // marks, emoji and lone punctuation.
+        let cases = [
+            "",
+            " ",
+            "  ",
+            "\n",
+            "\r\n",
+            " \r\n ",
+            "\t\t x",
+            "a",
+            "The quick brown fox jumps over the lazy dog.",
+            "don't, can't, I'LL, you'Ve, we'rE, it's, he'd, she'M",
+            "don'ts and 'tis and '' and 'x and ' ",
+            "0 1 12 123 1234 12345 -1 3.14 1,000",
+            "foo(bar)[baz]{qux} <a href=\"#\">x</a>;;;\n\n\n",
+            "if (x == 1) {\r\n\treturn 2;\r\n}\r\n",
+            "  leading and trailing spaces   ",
+            "trailing whitespace at end of text   ",
+            "Ünïcödé Ångström ß áé ñ",
+            "日本語のテキスト、句読点付き。",
+            "Здравствуй, мир! Привет 42",
+            "emoji 🎉🎉 and 👍🏽 and flags 🇫🇷",
+            "e\u{0301}cole cafe\u{0301} combining marks",
+            "٣٤٥ arabic-indic digits ﷼",
+            "mixed42text9with0digits",
+            "'s'd'm't'll've're'S'D'M'T'LL'VE'RE",
+            "a\nb\n\nc\n\n\nd",
+            "x\u{00a0}nbsp\u{00a0}y",
+            "line one\nline two\n",
+            " \u{2028}\u{2029}\u{000b}\u{000c}",
+        ];
+        for (original, rewritten) in super::SPLIT_PATTERN_REWRITES {
+            let original_re = Regex::new(original).unwrap();
+            let rewritten_re = Regex::new(rewritten).unwrap();
+            for case in cases {
+                let expected: Vec<&str> = original_re
+                    .find_iter(case)
+                    .map(|m| m.unwrap().as_str())
+                    .collect();
+                let got: Vec<&str> = rewritten_re
+                    .find_iter(case)
+                    .map(|m| m.unwrap().as_str())
+                    .collect();
+                assert_eq!(expected, got, "pattern {rewritten:?} on {case:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_patterns_are_compiled_verbatim() {
+        let pattern = r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++";
+        assert_eq!(super::split_pattern_to_compile(pattern), pattern);
+        for (original, rewritten) in super::SPLIT_PATTERN_REWRITES {
+            assert_eq!(super::split_pattern_to_compile(original), rewritten);
+        }
     }
 }
