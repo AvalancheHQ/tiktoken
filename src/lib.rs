@@ -688,17 +688,12 @@ impl CoreBPE {
         // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
         // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
         // lock-free path), paying the compile cost once at construction rather than on the hot path.
-        // `fancy_regex` is built without its `std` feature (see Cargo.toml), so its error type
-        // does not implement `std::error::Error`; carry the message instead, which is what the
-        // Python layer reports anyway.
         let regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(pattern))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+            .collect::<Result<Vec<_>, _>>()?;
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             encoder,
