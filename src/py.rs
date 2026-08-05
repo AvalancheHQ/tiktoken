@@ -4,11 +4,11 @@ use pyo3::{
     IntoPyObjectExt, PyResult, exceptions,
     prelude::*,
     pybacked::PyBackedStr,
-    types::{PyBytes, PyList},
+    types::{PyBytes, PyDict, PyList},
 };
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::{CoreBPE, Rank, byte_pair_encode};
+use crate::{CoreBPE, DataGymByteTable, DataGymError, Rank, byte_pair_encode};
 
 #[pymethods]
 impl CoreBPE {
@@ -308,8 +308,70 @@ impl TiktokenBuffer {
     }
 }
 
+/// Builds the mergeable-ranks table of the GPT-2 vocabulary from its two "data
+/// gym" files.
+///
+/// `data_gym_byte_to_byte` maps each of the printable characters those files use
+/// to the byte it stands for, and `single_bytes` lists the one-byte tokens in
+/// rank order; both are built by `tiktoken/load.py`, which owns the
+/// `str.isprintable()` rules. `vocab_bpe` is the merge list and `encoder_json`
+/// the same table as JSON, used to cross-check the result.
+///
+/// Doing this in the core replaces ~150k per-character Python dict lookups (two
+/// per merge plus one per `encoder.json` key) with flat-table lookups, and
+/// checks `encoder.json` while streaming it instead of building a 50k-entry dict
+/// only to compare it away.
+#[pyfunction]
+#[pyo3(signature = (data_gym_byte_to_byte, single_bytes, vocab_bpe, encoder_json, clobber_one_byte_tokens=false))]
+fn data_gym_mergeable_ranks<'py>(
+    py: Python<'py>,
+    data_gym_byte_to_byte: &Bound<'py, PyDict>,
+    single_bytes: Vec<u8>,
+    vocab_bpe: &str,
+    encoder_json: &[u8],
+    clobber_one_byte_tokens: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let mut mapping = Vec::with_capacity(data_gym_byte_to_byte.len());
+    for (ch, byte) in data_gym_byte_to_byte.iter() {
+        mapping.push((ch.extract::<char>()?, byte.extract::<u8>()?));
+    }
+    let table = DataGymByteTable::new(mapping).map_err(data_gym_err)?;
+
+    let ranks = py
+        .detach(|| {
+            crate::data_gym_mergeable_ranks(
+                &table,
+                &single_bytes,
+                vocab_bpe,
+                encoder_json,
+                clobber_one_byte_tokens,
+            )
+        })
+        .map_err(data_gym_err)?;
+
+    // Insertion order matches the Python loader's: one-byte tokens in rank
+    // order, then one token per merge in file order.
+    let result = PyDict::new(py);
+    for (token, rank) in &ranks {
+        result.set_item(PyBytes::new(py, token), *rank)?;
+    }
+    Ok(result)
+}
+
+/// A table that disagrees with `encoder.json` was reported by the Python
+/// loader's `assert`, so keep raising `AssertionError` for it; a file we cannot
+/// parse is a `ValueError`.
+fn data_gym_err(e: DataGymError) -> PyErr {
+    if e.is_mismatch {
+        PyErr::new::<exceptions::PyAssertionError, _>(e.message)
+    } else {
+        PyErr::new::<exceptions::PyValueError, _>(e.message)
+    }
+}
+
 #[pymodule(gil_used = false)]
 fn _tiktoken(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<CoreBPE>()?;
+    m.add_function(wrap_pyfunction!(data_gym_mergeable_ranks, m)?)?;
     Ok(())
 }

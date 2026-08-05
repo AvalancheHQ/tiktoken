@@ -18,6 +18,7 @@ import functools
 import pytest
 
 import tiktoken
+import tiktoken.load
 
 # Encodings covering the two main BPE regex/vocabulary generations used by
 # OpenAI models: the GPT-2/GPT-3 family (gpt2) and the GPT-4 family (cl100k_base).
@@ -80,6 +81,33 @@ def test_decode(benchmark, encoding_name: str, size: str) -> None:
     tokens = enc.encode_ordinary(TEXT_SIZES[size])
     text = benchmark(enc.decode, tokens)
     assert text
+
+
+# The GPT-2 vocabulary is not shipped in the `.tiktoken` format: it is the
+# original "data gym" pair of files (`vocab.bpe` merge list + `encoder.json`).
+# Turning them into a mergeable-ranks table is what a fresh process pays before
+# it can encode anything with `gpt2` — the files come from tiktoken's on-disk
+# cache, but the table is rebuilt in every process.
+DATA_GYM_VOCAB = {
+    "vocab_bpe_file": "https://openaipublic.blob.core.windows.net/gpt-2/encodings/main/vocab.bpe",
+    "vocab_bpe_hash": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+    "encoder_json_file": "https://openaipublic.blob.core.windows.net/gpt-2/encodings/main/encoder.json",
+    "encoder_json_hash": "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783",
+}
+
+
+def test_load_data_gym_ranks(benchmark) -> None:
+    # Populate tiktoken's on-disk cache so the download is not measured.
+    tiktoken.load.read_file_cached(
+        DATA_GYM_VOCAB["vocab_bpe_file"], DATA_GYM_VOCAB["vocab_bpe_hash"]
+    )
+    tiktoken.load.read_file_cached(
+        DATA_GYM_VOCAB["encoder_json_file"], DATA_GYM_VOCAB["encoder_json_hash"]
+    )
+    ranks = benchmark(
+        functools.partial(tiktoken.load.data_gym_to_mergeable_bpe_ranks, **DATA_GYM_VOCAB)
+    )
+    assert len(ranks) == 50256
 
 
 @pytest.mark.parametrize("encoding_name", ENCODING_NAMES)

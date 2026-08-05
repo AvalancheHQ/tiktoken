@@ -720,6 +720,412 @@ impl CoreBPE {
     }
 }
 
+// ============================================================================
+// GPT-2 ("data gym") vocabulary files
+// ============================================================================
+//
+// The GPT-2 vocabulary does not ship in the `.tiktoken` format. It is the
+// original pair of files: `vocab.bpe`, a priority-ordered list of merges, and
+// `encoder.json`, the same table spelled out as token -> rank. Both files write
+// a token's bytes as a string of printable characters, one character per byte.
+//
+// Turning them into a mergeable-ranks table used to be a pure-Python loop that
+// decoded every one of those characters through a dict lookup — twice per merge
+// plus once per `encoder.json` key, ~150k calls for GPT-2. The primitives below
+// do that work with a flat table instead, and cross-check `encoder.json` in a
+// single streaming pass so the loader no longer has to build a throwaway
+// 50k-entry dict just to compare it away.
+
+/// Error raised while building the mergeable ranks from the GPT-2 vocabulary
+/// files: a malformed file, or a table that disagrees with `encoder.json`.
+#[derive(Debug, Clone)]
+pub struct DataGymError {
+    pub message: String,
+    /// Set when the two files parse fine but describe different tables. The
+    /// Python loader reported that case with an `assert`, so the binding keeps
+    /// raising `AssertionError` for it.
+    pub is_mismatch: bool,
+}
+
+impl DataGymError {
+    fn malformed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            is_mismatch: false,
+        }
+    }
+
+    fn mismatch(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            is_mismatch: true,
+        }
+    }
+}
+
+impl std::fmt::Display for DataGymError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for DataGymError {}
+
+/// Maps the printable characters the GPT-2 vocabulary files use back to the
+/// bytes they stand for.
+///
+/// The mapping itself is built by `tiktoken/load.py` (it owns the
+/// `str.isprintable()` rules) and handed over as `char -> byte` pairs. Every
+/// character it uses is below [`Self::TABLE_LEN`], so a flat table resolves one
+/// with a single indexed load instead of a hash lookup.
+pub struct DataGymByteTable {
+    table: Box<[u16; Self::TABLE_LEN]>,
+}
+
+impl DataGymByteTable {
+    const TABLE_LEN: usize = 512;
+    const UNMAPPED: u16 = u16::MAX;
+
+    pub fn new(mapping: impl IntoIterator<Item = (char, u8)>) -> Result<Self, DataGymError> {
+        let mut table = Box::new([Self::UNMAPPED; Self::TABLE_LEN]);
+        for (ch, byte) in mapping {
+            let slot = usize::try_from(u32::from(ch))
+                .ok()
+                .filter(|&slot| slot < Self::TABLE_LEN)
+                .ok_or_else(|| {
+                    DataGymError::malformed(format!(
+                        "data gym character {ch:?} is outside the supported range"
+                    ))
+                })?;
+            table[slot] = u16::from(byte);
+        }
+        Ok(Self { table })
+    }
+
+    /// Appends the byte `ch` stands for to `out`.
+    #[inline]
+    fn push_byte_of(&self, ch: char, out: &mut Vec<u8>) -> Result<(), DataGymError> {
+        let slot = u32::from(ch) as usize;
+        match self.table.get(slot) {
+            Some(&byte) if byte != Self::UNMAPPED => {
+                out.push(byte as u8);
+                Ok(())
+            }
+            _ => Err(DataGymError::malformed(format!(
+                "{ch:?} is not a data gym character"
+            ))),
+        }
+    }
+
+    /// Appends the bytes `s` stands for to `out`.
+    pub fn push_decoded(&self, s: &str, out: &mut Vec<u8>) -> Result<(), DataGymError> {
+        out.reserve(s.len());
+        for ch in s.chars() {
+            self.push_byte_of(ch, out)?;
+        }
+        Ok(())
+    }
+}
+
+/// The merge pairs of a `vocab.bpe` file, in priority order.
+///
+/// Mirrors `contents.split("\n")[1:-1]` followed by `merge_str.split()`: the
+/// first line is the version header and the piece after the final newline is
+/// dropped.
+pub fn data_gym_merge_pairs(contents: &str) -> DataGymMergePairs<'_> {
+    let mut lines = contents.split('\n');
+    lines.next(); // version header
+    DataGymMergePairs {
+        lines: lines.peekable(),
+    }
+}
+
+pub struct DataGymMergePairs<'a> {
+    lines: std::iter::Peekable<std::str::Split<'a, char>>,
+}
+
+impl<'a> Iterator for DataGymMergePairs<'a> {
+    type Item = Result<(&'a str, &'a str), DataGymError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let line = self.lines.next()?;
+        // The `[..-1]` half of the Python slice: whatever follows the last
+        // newline is not a merge.
+        self.lines.peek()?;
+        let mut halves = line.split_whitespace();
+        Some(match (halves.next(), halves.next(), halves.next()) {
+            (Some(first), Some(second), None) => Ok((first, second)),
+            _ => Err(DataGymError::malformed(format!(
+                "expected two merge halves in vocab.bpe line {line:?}"
+            ))),
+        })
+    }
+}
+
+/// Streams a flat `{"token": rank, ...}` JSON object — the shape of the GPT-2
+/// `encoder.json` — decoding every key's characters straight into token bytes
+/// and handing each entry to `visit`.
+///
+/// Deliberately strict: only that exact shape is accepted, so anything else is
+/// reported as malformed rather than silently reinterpreted. Keys are decoded
+/// into a reused buffer, so no per-token allocation is needed to check the file.
+pub fn for_each_encoder_json_entry(
+    contents: &[u8],
+    table: &DataGymByteTable,
+    mut visit: impl FnMut(&[u8], Rank) -> Result<(), DataGymError>,
+) -> Result<(), DataGymError> {
+    let text = std::str::from_utf8(contents)
+        .map_err(|e| DataGymError::malformed(format!("encoder.json is not valid UTF-8: {e}")))?;
+    let mut scanner = JsonScanner { text, pos: 0 };
+    let mut token = Vec::new();
+
+    scanner.skip_whitespace();
+    scanner.expect(b'{')?;
+    scanner.skip_whitespace();
+    if scanner.peek() == Some(b'}') {
+        scanner.pos += 1;
+    } else {
+        loop {
+            scanner.skip_whitespace();
+            token.clear();
+            scanner.read_string_as_bytes(table, &mut token)?;
+            scanner.skip_whitespace();
+            scanner.expect(b':')?;
+            scanner.skip_whitespace();
+            let rank = scanner.read_rank()?;
+            visit(&token, rank)?;
+            scanner.skip_whitespace();
+            match scanner.bump() {
+                Some(b',') => continue,
+                Some(b'}') => break,
+                _ => return Err(scanner.error("expected ',' or '}'")),
+            }
+        }
+    }
+    scanner.skip_whitespace();
+    if scanner.pos != scanner.text.len() {
+        return Err(scanner.error("expected end of encoder.json"));
+    }
+    Ok(())
+}
+
+struct JsonScanner<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl<'a> JsonScanner<'a> {
+    #[inline]
+    fn peek(&self) -> Option<u8> {
+        self.text.as_bytes().get(self.pos).copied()
+    }
+
+    #[inline]
+    fn bump(&mut self) -> Option<u8> {
+        let byte = self.peek()?;
+        self.pos += 1;
+        Some(byte)
+    }
+
+    #[inline]
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn expect(&mut self, byte: u8) -> Result<(), DataGymError> {
+        if self.bump() == Some(byte) {
+            Ok(())
+        } else {
+            self.pos = self.pos.saturating_sub(1);
+            Err(self.error(&format!("expected {:?}", byte as char)))
+        }
+    }
+
+    fn error(&self, what: &str) -> DataGymError {
+        DataGymError::malformed(format!(
+            "malformed encoder.json: {what} at byte {}",
+            self.pos
+        ))
+    }
+
+    /// Reads a JSON string, mapping each of its characters through `table`.
+    fn read_string_as_bytes(
+        &mut self,
+        table: &DataGymByteTable,
+        out: &mut Vec<u8>,
+    ) -> Result<(), DataGymError> {
+        self.expect(b'"')?;
+        loop {
+            let byte = self
+                .peek()
+                .ok_or_else(|| self.error("unterminated string"))?;
+            match byte {
+                b'"' => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    let ch = self.read_escape()?;
+                    table.push_byte_of(ch, out)?;
+                }
+                0x00..=0x1f => return Err(self.error("unescaped control character")),
+                _ => {
+                    // `self.text` is valid UTF-8 and `pos` sits on a character
+                    // boundary, so a character is always there to read.
+                    let ch = self.text[self.pos..].chars().next().unwrap();
+                    self.pos += ch.len_utf8();
+                    table.push_byte_of(ch, out)?;
+                }
+            }
+        }
+    }
+
+    fn read_escape(&mut self) -> Result<char, DataGymError> {
+        let byte = self
+            .bump()
+            .ok_or_else(|| self.error("unterminated escape"))?;
+        Ok(match byte {
+            b'"' => '"',
+            b'\\' => '\\',
+            b'/' => '/',
+            b'b' => '\u{8}',
+            b'f' => '\u{c}',
+            b'n' => '\n',
+            b'r' => '\r',
+            b't' => '\t',
+            b'u' => {
+                let unit = self.read_hex4()?;
+                match unit {
+                    0xd800..=0xdbff => {
+                        if self.bump() != Some(b'\\') || self.bump() != Some(b'u') {
+                            return Err(self.error("unpaired surrogate escape"));
+                        }
+                        let low = self.read_hex4()?;
+                        if !(0xdc00..=0xdfff).contains(&low) {
+                            return Err(self.error("unpaired surrogate escape"));
+                        }
+                        let code = 0x1_0000
+                            + ((u32::from(unit) - 0xd800) << 10)
+                            + (u32::from(low) - 0xdc00);
+                        char::from_u32(code).ok_or_else(|| self.error("invalid surrogate pair"))?
+                    }
+                    0xdc00..=0xdfff => return Err(self.error("unpaired surrogate escape")),
+                    _ => char::from_u32(u32::from(unit))
+                        .ok_or_else(|| self.error("invalid escape"))?,
+                }
+            }
+            _ => return Err(self.error("unknown escape")),
+        })
+    }
+
+    fn read_hex4(&mut self) -> Result<u16, DataGymError> {
+        let mut unit = 0u16;
+        for _ in 0..4 {
+            let digit = self
+                .bump()
+                .and_then(|byte| (byte as char).to_digit(16))
+                .ok_or_else(|| self.error("expected four hex digits"))?;
+            unit = unit * 16 + digit as u16;
+        }
+        Ok(unit)
+    }
+
+    fn read_rank(&mut self) -> Result<Rank, DataGymError> {
+        let start = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return Err(self.error("expected a rank"));
+        }
+        self.text[start..self.pos]
+            .parse()
+            .map_err(|_| self.error("rank out of range"))
+    }
+}
+
+/// Builds the mergeable-ranks table of the GPT-2 vocabulary.
+///
+/// `single_bytes` are the one-byte tokens in rank order and `vocab_bpe` is the
+/// contents of `vocab.bpe`; together they define every token and its rank.
+/// `encoder_json` is then streamed to cross-check the result, which is what the
+/// Python loader's `assert bpe_ranks == encoder_json_loaded` did — tiktoken
+/// relies on ranks being ordered by merge priority, so the check is load
+/// bearing. With `clobber_one_byte_tokens` the one-byte ranks are taken from
+/// `encoder.json` instead of being checked against it.
+///
+/// Returns the tokens in rank order together with their ranks (they only differ
+/// from `0..n` when one-byte tokens are clobbered).
+pub fn data_gym_mergeable_ranks(
+    table: &DataGymByteTable,
+    single_bytes: &[u8],
+    vocab_bpe: &str,
+    encoder_json: &[u8],
+    clobber_one_byte_tokens: bool,
+) -> Result<Vec<(Vec<u8>, Rank)>, DataGymError> {
+    // Tokens in insertion order, which is also rank order: the one-byte tokens
+    // first, then one per merge.
+    let mut tokens: Vec<Vec<u8>> = single_bytes.iter().map(|&byte| vec![byte]).collect();
+    let mut merged = Vec::new();
+    for pair in data_gym_merge_pairs(vocab_bpe) {
+        let (first, second) = pair?;
+        merged.clear();
+        table.push_decoded(first, &mut merged)?;
+        table.push_decoded(second, &mut merged)?;
+        tokens.push(std::mem::take(&mut merged));
+    }
+    let mut ranks: Vec<Rank> = (0..tokens.len())
+        .map(|rank| {
+            Rank::try_from(rank)
+                .map_err(|_| DataGymError::malformed("too many tokens for a 32-bit rank"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    // A later merge that produces an already-known token wins, exactly like
+    // re-assigning the key in the Python dict.
+    let index: HashMap<&[u8], usize> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, token)| (token.as_slice(), i))
+        .collect();
+
+    // `encoder.json` also lists the special tokens, which are not mergeable.
+    const NOT_MERGEABLE: [&[u8]; 2] = [b"<|endoftext|>", b"<|startoftext|>"];
+    let mut checked = 0usize;
+    for_each_encoder_json_entry(encoder_json, table, |token, rank| {
+        if NOT_MERGEABLE.contains(&token) {
+            return Ok(());
+        }
+        checked += 1;
+        let &i = index.get(token).ok_or_else(|| {
+            DataGymError::mismatch(format!(
+                "encoder.json has token {token:?} (rank {rank}), which vocab.bpe does not produce"
+            ))
+        })?;
+        if clobber_one_byte_tokens && token.len() == 1 {
+            ranks[i] = rank;
+        } else if ranks[i] != rank {
+            return Err(DataGymError::mismatch(format!(
+                "encoder.json ranks token {token:?} {rank}, vocab.bpe ranks it {}",
+                ranks[i]
+            )));
+        }
+        Ok(())
+    })?;
+    if checked != index.len() {
+        return Err(DataGymError::mismatch(format!(
+            "vocab.bpe produces {} tokens, encoder.json lists {checked}",
+            index.len()
+        )));
+    }
+    drop(index);
+
+    Ok(tokens.into_iter().zip(ranks).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use fancy_regex::Regex;
@@ -743,5 +1149,127 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    /// The subset of the GPT-2 character mapping the tests below need: printable
+    /// ASCII stands for itself, and `Ġ`/`Ĉ` stand for the space and 0x08.
+    fn data_gym_table() -> crate::DataGymByteTable {
+        let mut mapping: Vec<(char, u8)> = (b'!'..=b'~').map(|byte| (byte as char, byte)).collect();
+        mapping.push(('Ġ', b' '));
+        mapping.push(('Ĉ', 0x08));
+        crate::DataGymByteTable::new(mapping).unwrap()
+    }
+
+    #[test]
+    fn test_data_gym_merge_pairs() {
+        // The version header and whatever follows the last newline are dropped,
+        // just like `contents.split("\n")[1:-1]`.
+        let pairs: Vec<_> = crate::data_gym_merge_pairs("#version: 0.2\nĠ t\nh e\n")
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(pairs, vec![("Ġ", "t"), ("h", "e")]);
+        assert_eq!(crate::data_gym_merge_pairs("").count(), 0);
+        assert_eq!(crate::data_gym_merge_pairs("#version: 0.2\n").count(), 0);
+        // A line without exactly two halves is malformed, as unpacking it was in
+        // Python.
+        assert!(
+            crate::data_gym_merge_pairs("#version: 0.2\nlonely\n")
+                .next()
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_encoder_json_entries() {
+        let table = data_gym_table();
+        let mut entries = Vec::new();
+        crate::for_each_encoder_json_entry(
+            br#" {"!": 0, "\"": 1, "\u0120t": 2, "\\": 3, "\u0108": 4} "#,
+            &table,
+            |token, rank| {
+                entries.push((token.to_vec(), rank));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (b"!".to_vec(), 0),
+                (b"\"".to_vec(), 1),
+                (b" t".to_vec(), 2),
+                (b"\\".to_vec(), 3),
+                (vec![0x08], 4),
+            ]
+        );
+
+        // An empty object is valid; anything that is not this exact shape is not.
+        crate::for_each_encoder_json_entry(b"{}", &table, |_, _| Ok(())).unwrap();
+        for malformed in [
+            &b"{"[..],
+            b"{\"!\" 0}",
+            b"{\"!\": }",
+            b"{\"!\": -1}",
+            b"{\"!\": 0,}",
+            b"{\"!\": 0} trailing",
+            b"{\"\\q\": 0}",
+            b"{\"\\ud800\": 0}",
+        ] {
+            assert!(
+                crate::for_each_encoder_json_entry(malformed, &table, |_, _| Ok(())).is_err(),
+                "{malformed:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_data_gym_mergeable_ranks() {
+        let table = data_gym_table();
+        let single_bytes = [b'!', b' '];
+        let vocab_bpe = "#version: 0.2\n! Ġ\n!Ġ !\n";
+        // Ranks: "!" 0, " " 1, "! " 2, "! !" 3.
+        let encoder_json = br#"{"!": 0, "\u0120": 1, "!\u0120": 2, "!\u0120!": 3}"#;
+        let ranks =
+            crate::data_gym_mergeable_ranks(&table, &single_bytes, vocab_bpe, encoder_json, false)
+                .unwrap();
+        assert_eq!(
+            ranks,
+            vec![
+                (b"!".to_vec(), 0),
+                (b" ".to_vec(), 1),
+                (b"! ".to_vec(), 2),
+                (b"! !".to_vec(), 3),
+            ]
+        );
+
+        // Special tokens in the encoder json are not mergeable and are ignored.
+        let with_special =
+            br#"{"!": 0, "\u0120": 1, "!\u0120": 2, "!\u0120!": 3, "<|endoftext|>": 9}"#;
+        assert!(
+            crate::data_gym_mergeable_ranks(&table, &single_bytes, vocab_bpe, with_special, false)
+                .is_ok()
+        );
+
+        // A disagreement between the two files is reported as a mismatch.
+        let disagrees = br#"{"!": 0, "\u0120": 1, "!\u0120": 3, "!\u0120!": 2}"#;
+        let err =
+            crate::data_gym_mergeable_ranks(&table, &single_bytes, vocab_bpe, disagrees, false)
+                .unwrap_err();
+        assert!(err.is_mismatch);
+        // As is a missing entry.
+        let incomplete = br#"{"!": 0, "\u0120": 1, "!\u0120": 2}"#;
+        assert!(
+            crate::data_gym_mergeable_ranks(&table, &single_bytes, vocab_bpe, incomplete, false)
+                .unwrap_err()
+                .is_mismatch
+        );
+
+        // Clobbering takes the one-byte ranks from the encoder json instead.
+        let clobbered = br#"{"!": 7, "\u0120": 1, "!\u0120": 2, "!\u0120!": 3}"#;
+        let ranks =
+            crate::data_gym_mergeable_ranks(&table, &single_bytes, vocab_bpe, clobbered, true)
+                .unwrap();
+        assert_eq!(ranks[0], (b"!".to_vec(), 7));
     }
 }
