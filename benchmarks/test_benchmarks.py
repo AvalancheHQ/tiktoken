@@ -42,9 +42,13 @@ _PARAGRAPH = (
 )
 
 
-def _make_text(target_len: int) -> str:
-    text = _PARAGRAPH * (target_len // len(_PARAGRAPH) + 1)
+def _make_text_from(paragraph: str, target_len: int) -> str:
+    text = paragraph * (target_len // len(paragraph) + 1)
     return text[:target_len]
+
+
+def _make_text(target_len: int) -> str:
+    return _make_text_from(_PARAGRAPH, target_len)
 
 
 # Small (~1 line), medium (~2 KB) and large (~64 KB) documents.
@@ -53,6 +57,28 @@ TEXT_SIZES = {
     "medium": _make_text(2_048),
     "large": _make_text(65_536),
 }
+
+
+# Text in scripts that are written without spaces between words (Japanese,
+# Chinese, Thai). The split pattern keeps a whole run of letters together, so
+# these inputs produce long multi-byte pieces that are not vocabulary entries
+# and therefore go through the byte-pair merges, unlike English prose where
+# almost every piece is a single token.
+_CJK_PARAGRAPH = (
+    "私はプログラミングが好きです。トークン化とはテキストを数値の列に変換する処理のことです。"
+    "言語モデルは文字ではなくトークンの並びを見ています。日本語や中国語には単語の区切りがありません。"
+    "语言模型看到的是词元序列而不是原始文本。字节对编码是一种把文本转换成词元的方法。"
+    "โมเดลภาษาเห็นลำดับของโทเคนไม่ใช่ข้อความดิบ"
+)
+
+CJK_TEXT = _make_text_from(_CJK_PARAGRAPH, 4_096)
+
+
+@pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
+def test_encode_ordinary_cjk(benchmark, encoding_name: str) -> None:
+    enc = _get_encoding(encoding_name)
+    tokens = benchmark(enc.encode_ordinary, CJK_TEXT)
+    assert tokens
 
 
 @pytest.mark.parametrize("encoding_name", ENCODING_NAMES)

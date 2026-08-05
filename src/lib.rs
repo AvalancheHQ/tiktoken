@@ -16,17 +16,27 @@ use std::collections::BinaryHeap;
 
 #[derive(Eq, PartialEq, Clone, Copy)]
 struct Merge {
-    start: usize,
+    start: u32,
     rank: Rank,
+}
+
+impl Merge {
+    /// Orders merges the way the algorithm wants to pop them: lowest rank
+    /// first, and leftmost first within a rank. Packing both fields into one
+    /// `u64` turns the comparison the heap performs on every sift step into a
+    /// single integer compare, and keeping `start` a `u32` halves the element
+    /// size so the heap moves half as many bytes.
+    #[inline(always)]
+    fn key(self) -> u64 {
+        ((self.rank as u64) << 32) | (self.start as u64)
+    }
 }
 
 impl Ord for Merge {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .rank
-            .cmp(&self.rank)
-            .then_with(|| other.start.cmp(&self.start))
+        // Reversed: `BinaryHeap` is a max-heap and we want the smallest key.
+        other.key().cmp(&self.key())
     }
 }
 
@@ -57,7 +67,10 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
     let mut heap = BinaryHeap::with_capacity(piece.len());
     for i in 0..piece.len() - 1 {
         if let Some(&rank) = ranks.get(&piece[i..i + 2]) {
-            heap.push(Merge { start: i, rank });
+            heap.push(Merge {
+                start: i as u32,
+                rank,
+            });
             state[i].next_rank = rank;
         }
         // note this is happening offset by 1
@@ -88,7 +101,10 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
                 && let Some(&rank) = ranks.get(&piece[start..next_end_item])
             {
                 // We have a valid potential merge!
-                heap.push(Merge { start, rank });
+                heap.push(Merge {
+                    start: start as u32,
+                    rank,
+                });
                 state[start].next_rank = rank;
             }
         }
@@ -98,11 +114,11 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
         if left.rank == Rank::MAX {
             break;
         }
-        if left.rank != state[left.start].next_rank {
+        let left_start = left.start as usize;
+        if left.rank != state[left_start].next_rank {
             continue; // This merge was invalidated, ignore it
         }
 
-        let left_start = left.start;
         let right_start = state[left_start].end;
         let right_end = state[left_start].next_end;
         debug_assert!(right_end == state[right_start].end);
@@ -195,13 +211,33 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
     parts
 }
 
+/// Piece length at which the heap-based merge overtakes the linear-scan one.
+///
+/// `_byte_pair_merge` re-scans every part to find the next merge and memmoves
+/// the tail of `parts` on every merge, so it costs O(n²) for a piece of n
+/// bytes; `_byte_pair_merge_large` keeps the candidate merges in a heap and
+/// costs O(n log n), at the price of a bigger per-piece state and worse cache
+/// locality. For the short pieces that dominate space-separated scripts (a
+/// word plus its leading space, i.e. a handful of bytes) the linear scan wins,
+/// which is why it is the default.
+///
+/// But a piece is a whole run of letters, and scripts written without spaces
+/// between words (Chinese, Japanese, Thai) produce runs of tens of bytes that
+/// are not vocabulary entries, so every one of them is merged here with n far
+/// past the crossover. Sending those to the heap-based merge is a large win on
+/// such text and leaves the short-piece path untouched.
+const HEAP_MERGE_MIN_PIECE_LEN: usize = 20;
+
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
     let piece_len = piece.len();
 
     if piece_len == 1 {
         return vec![ranks[piece]];
     }
-    if piece_len < 100 {
+    // The `u32` merge positions cap the heap-based merge at 4 GiB pieces. Such a
+    // piece could never be merged anyway (its `state` alone would need 32 bytes
+    // per input byte), but stay correct rather than truncating a position.
+    if piece_len < HEAP_MERGE_MIN_PIECE_LEN || piece_len > u32::MAX as usize {
         return _byte_pair_merge(ranks, piece)
             .windows(2)
             .map(|part| ranks[&piece[part[0].0..part[1].0]])
@@ -743,5 +779,52 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    /// `byte_pair_encode` picks between two merge implementations by piece
+    /// length, so they must agree for every piece. Check that on a vocabulary
+    /// and pieces resembling the ones a real tokeniser sees.
+    #[test]
+    fn test_merge_implementations_agree() {
+        use crate::{_byte_pair_merge, _byte_pair_merge_large};
+
+        // Every single byte, plus a spread of longer tokens, ranked so that
+        // merge priority is a non-trivial function of the bytes.
+        let mut ranks: HashMap<Vec<u8>, Rank> = HashMap::default();
+        for b in 0u8..=255 {
+            ranks.insert(vec![b], b as Rank);
+        }
+        let mut next_rank = 256;
+        for a in b'a'..=b'f' {
+            for b in b'a'..=b'f' {
+                ranks.insert(vec![a, b], next_rank);
+                next_rank += 1;
+                for c in b'a'..=b'f' {
+                    ranks.insert(vec![a, b, c], next_rank);
+                    next_rank += 1;
+                }
+            }
+        }
+
+        // Deterministic pseudo-random pieces over that alphabet, at every
+        // length that either implementation can be asked to handle.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for len in 2..=140usize {
+            for _ in 0..20 {
+                let piece: Vec<u8> = (0..len).map(|_| b'a' + (next() % 6) as u8).collect();
+                let linear: Vec<Rank> = _byte_pair_merge(&ranks, &piece)
+                    .windows(2)
+                    .map(|part| ranks[&piece[part[0].0..part[1].0]])
+                    .collect();
+                let heap = _byte_pair_merge_large(&ranks, &piece);
+                assert_eq!(linear, heap, "piece {piece:?}");
+            }
+        }
     }
 }
