@@ -259,6 +259,249 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
+// Splitting the pattern
+// =====================
+// `fancy_regex` compiles every top-level alternative that contains no "fancy"
+// construct into a *single* delegated `regex-automata` search. Setting up such a
+// search (input span, anchored start state, cache) costs far more than looking at
+// one byte, and both patterns tiktoken ships start with a contraction
+// alternative — `'(?i:[sdmt]|ll|ve|re)` for cl100k, `'(?:[sdmt]|ll|ve|re)` for
+// r50k/gpt2 — that needs an apostrophe and therefore fails at nearly every piece
+// start in ordinary text.
+//
+// `fancy_regex`'s compiler splits a concatenation at its first non-const-size or
+// "hard" child: a constant-size literal prefix is emitted as `Insn::Lit`, which
+// the VM checks with a byte comparison. So wrapping everything after the literal
+// prefix in an atomic group makes the alternative hard and turns the futile
+// automaton search into a byte test, while the pattern itself is unchanged
+// otherwise.
+//
+// The atomic group cannot change what is matched: it wraps the tail of a
+// *top-level* alternative, so nothing follows it that could fail and make the
+// engine backtrack into it — and a match of the alternative is a match of the
+// whole pattern. The rewrite is only applied to alternatives that `fancy_regex`
+// would delegate wholesale (no lookaround, no possessive quantifier, no
+// backreference, no `\G`/`\K`, no capture group), and only after the rewritten
+// pattern is verified at construction to split exactly like the original.
+
+/// Probe strings used to verify that a rewritten split pattern produces exactly
+/// the same pieces as the pattern as written.
+const SPLIT_PROBES: &[&str] = &[
+    "",
+    "'",
+    "''",
+    "'s",
+    "'S",
+    "'T",
+    "'t",
+    "'ll",
+    "'lla",
+    "'LL",
+    "'ve",
+    "'re",
+    "'d",
+    "'m",
+    "'x",
+    "'0",
+    "' ",
+    "'\n",
+    "a'b",
+    "don't",
+    "It's",
+    "IT'S",
+    "isn't it 'quoted' text",
+    "l'été",
+    "'ſ",
+    "'İ",
+    "hello world",
+    " leading space",
+    "trailing space ",
+    "multiple   spaces",
+    "\n\n  \t\r\n",
+    "  \n",
+    "123 4567 89",
+    "a1b2c3",
+    "punctuation!!! ...?",
+    "<|endoftext|>",
+    "naïve café",
+    "日本語のテキスト",
+    "emoji 🙂🙃 mix",
+    "combining e\u{301}",
+    "non\u{a0}breaking",
+    "Ⅷ roman Ⅻ",
+    "mixed 'a' 1 \n ok",
+];
+
+/// Returns the top-level alternatives of `pattern`, or `None` when the pattern
+/// uses syntax this (deliberately simple) scanner does not fully understand.
+fn top_level_alternatives(pattern: &str) -> Option<Vec<&str>> {
+    let bytes = pattern.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                // Skip the escaped byte; a trailing backslash is invalid syntax.
+                i += 1;
+                if i >= bytes.len() {
+                    return None;
+                }
+            }
+            b'[' => {
+                if in_class {
+                    // Nested class (class set operations) — not understood here.
+                    return None;
+                }
+                // `[]` / `[^]` and nested classes are not handled; bail out.
+                let rest = &bytes[i + 1..];
+                match rest.first() {
+                    Some(b'^') if rest.get(1) == Some(&b']') => return None,
+                    Some(b']') => return None,
+                    None => return None,
+                    _ => {}
+                }
+                in_class = true;
+            }
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => depth += 1,
+            b')' if !in_class => depth = depth.checked_sub(1)?,
+            b'|' if !in_class && depth == 0 => {
+                parts.push(&pattern[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_class || depth != 0 {
+        return None;
+    }
+    parts.push(&pattern[start..]);
+    Some(parts)
+}
+
+/// Length (in bytes) of the leading run of plain literal characters of `alt`
+/// that is not affected by a quantifier.
+fn literal_prefix_len(alt: &str) -> usize {
+    const META: &[char] = &[
+        '\\', '[', ']', '(', ')', '{', '}', '|', '^', '$', '.', '*', '+', '?',
+    ];
+    let mut end = 0usize;
+    let mut last_char_start = None;
+    for (idx, ch) in alt.char_indices() {
+        if META.contains(&ch) {
+            // A quantifier applies to the last literal character, so that
+            // character is not part of a fixed prefix.
+            if matches!(ch, '*' | '+' | '?' | '{') {
+                return last_char_start.unwrap_or(0);
+            }
+            break;
+        }
+        last_char_start = Some(idx);
+        end = idx + ch.len_utf8();
+    }
+    end
+}
+
+/// True when `alt` contains only constructs `fancy_regex` can delegate to
+/// `regex-automata` as one search, i.e. the case this rewrite targets.
+fn is_plain_alternative(alt: &str) -> bool {
+    // Possessive quantifiers, lookaround, atomic groups, backreferences,
+    // `\G`/`\K` and capture groups all either make the alternative "hard"
+    // already or make the rewrite harder to reason about.
+    const REJECT: &[&str] = &[
+        "*+", "++", "?+", "}+", "(?=", "(?!", "(?<", "(?>", "(?P", "(?'", "\\G", "\\K", "\\g",
+        "\\k",
+    ];
+    if REJECT.iter().any(|needle| alt.contains(needle)) {
+        return false;
+    }
+    if alt.bytes().enumerate().any(|(i, b)| {
+        // A digit escape is a backreference.
+        b.is_ascii_digit() && i > 0 && alt.as_bytes()[i - 1] == b'\\'
+    }) {
+        return false;
+    }
+    // Capture groups: `(` not followed by `?`.
+    let bytes = alt.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'(' if bytes.get(i + 1) != Some(&b'?') => return false,
+            _ => {}
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Rewrites `pattern` so that top-level alternatives with a literal prefix are
+/// compiled as a literal test followed by a delegated search, instead of one
+/// delegated search covering the whole alternative. Returns `None` when nothing
+/// can be rewritten.
+fn atomize_literal_prefixed_alternatives(pattern: &str) -> Option<String> {
+    let alternatives = top_level_alternatives(pattern)?;
+    if alternatives.len() < 2 {
+        // With a single alternative there is no cheap rejection to win.
+        return None;
+    }
+    let mut rewritten = String::with_capacity(pattern.len() + 8);
+    let mut changed = false;
+    for (i, alt) in alternatives.iter().enumerate() {
+        if i > 0 {
+            rewritten.push('|');
+        }
+        let prefix_len = literal_prefix_len(alt);
+        let rest = &alt[prefix_len..];
+        if prefix_len > 0 && !rest.is_empty() && is_plain_alternative(alt) {
+            rewritten.push_str(&alt[..prefix_len]);
+            rewritten.push_str("(?>");
+            rewritten.push_str(rest);
+            rewritten.push(')');
+            changed = true;
+        } else {
+            rewritten.push_str(alt);
+        }
+    }
+    if changed { Some(rewritten) } else { None }
+}
+
+/// True when `candidate` produces exactly the same pieces as `original` for
+/// every probe string.
+fn splits_identically(original: &Regex, candidate: &Regex) -> bool {
+    for probe in SPLIT_PROBES {
+        let mut expected = original.find_iter(probe);
+        let mut actual = candidate.find_iter(probe);
+        loop {
+            match (expected.next(), actual.next()) {
+                (None, None) => break,
+                (Some(Ok(a)), Some(Ok(b))) if a.start() == b.start() && a.end() == b.end() => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// The pattern to compile the thread-local split regexes from: the rewritten
+/// form when it is available and verified equivalent, the pattern as written
+/// otherwise. Compiling the pattern as written also validates it, so an invalid
+/// pattern is still reported here.
+fn split_pattern_for(pattern: &str) -> Result<String, fancy_regex::Error> {
+    let original = Regex::new(pattern)?;
+    if let Some(rewritten) = atomize_literal_prefixed_alternatives(pattern)
+        && let Ok(candidate) = Regex::new(&rewritten)
+        && splits_identically(&original, &candidate)
+    {
+        return Ok(rewritten);
+    }
+    Ok(pattern.to_string())
+}
+
 struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -688,8 +931,13 @@ impl CoreBPE {
         // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
         // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
         // lock-free path), paying the compile cost once at construction rather than on the hot path.
+        //
+        // The pattern is also rewritten so that alternatives with a literal
+        // prefix are rejected with a byte comparison instead of a delegated
+        // automaton search; see the notes above `SPLIT_PROBES`.
+        let split_pattern = split_pattern_for(pattern)?;
         let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
+            .map(|_| Regex::new(&split_pattern))
             .collect::<Result<Vec<_>, _>>()?;
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
@@ -743,5 +991,84 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PAT: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K_PAT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]|\s+(?!\S)|\s+";
+
+    #[test]
+    fn test_shipped_patterns_are_rewritten_and_equivalent() {
+        for pattern in [R50K_PAT, CL100K_PAT] {
+            let rewritten = crate::atomize_literal_prefixed_alternatives(pattern)
+                .expect("the contraction alternative should be rewritten");
+            assert!(rewritten.contains("(?>"));
+            assert_eq!(
+                crate::split_pattern_for(pattern).unwrap(),
+                rewritten,
+                "the rewrite must pass the equivalence check"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewritten_pattern_splits_identically() {
+        // Beyond the construction-time probes, check the piece streams agree on
+        // text that exercises the contraction alternative directly.
+        let cases = [
+            "It's the dog's, isn't it? 'quoted' 'x' 'LL 'll'll",
+            "don't\n'\t'’s l'été 'ſ 'İ",
+            "a'b'c 1'2 '' ''' ' '",
+        ];
+        for pattern in [R50K_PAT, CL100K_PAT, O200K_PAT] {
+            let original = Regex::new(pattern).unwrap();
+            let rewritten = Regex::new(&crate::split_pattern_for(pattern).unwrap()).unwrap();
+            for case in cases {
+                let expected: Vec<_> = original
+                    .find_iter(case)
+                    .map(|m| m.unwrap().as_str())
+                    .collect();
+                let actual: Vec<_> = rewritten
+                    .find_iter(case)
+                    .map(|m| m.unwrap().as_str())
+                    .collect();
+                assert_eq!(expected, actual, "pattern {pattern:?} on {case:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_rewrite_refuses_unsupported_alternatives() {
+        // Capture group, backreference, lookaround and possessive quantifiers in
+        // the alternative are left alone.
+        assert!(crate::atomize_literal_prefixed_alternatives(r"a(b)|c").is_none());
+        assert!(crate::atomize_literal_prefixed_alternatives(r"a(?:b)\1|c").is_none());
+        assert!(crate::atomize_literal_prefixed_alternatives(r"a(?=b)|c").is_none());
+        assert!(crate::atomize_literal_prefixed_alternatives(r"ab++|c").is_none());
+        // Nothing to hoist: no literal prefix, or no tail after it.
+        assert!(crate::atomize_literal_prefixed_alternatives(r"\s+|\w+").is_none());
+        assert!(crate::atomize_literal_prefixed_alternatives(r"ab|cd").is_none());
+        // A single alternative is left alone.
+        assert!(crate::atomize_literal_prefixed_alternatives(r"a\w+").is_none());
+        // Unbalanced/unsupported syntax bails out of the scanner.
+        assert!(crate::top_level_alternatives(r"a(b|c").is_none());
+        assert!(crate::top_level_alternatives(r"a[]|b").is_none());
+        assert!(crate::top_level_alternatives(r"a\").is_none());
+    }
+
+    #[test]
+    fn test_rewrite_hoists_only_the_unquantified_prefix() {
+        // The quantified `' '` is not part of the fixed prefix, so only `x` is
+        // hoisted out of the second alternative.
+        assert_eq!(
+            crate::atomize_literal_prefixed_alternatives(r"ab\w+|x ?\w+").as_deref(),
+            Some(r"ab(?>\w+)|x(?> ?\w+)")
+        );
+    }
+
+    #[test]
+    fn test_invalid_pattern_still_errors() {
+        assert!(crate::split_pattern_for(r"a(").is_err());
     }
 }
