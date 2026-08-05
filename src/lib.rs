@@ -259,6 +259,399 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
+// Tokeniser split pattern reordering
+// =================================
+//
+// The patterns tiktoken ships are a single top-level alternation whose first
+// alternative is the contraction one (`'(?:[sdmt]|ll|ve|re)` for r50k/gpt2/p50k,
+// `'(?i:[sdmt]|ll|ve|re)` for cl100k). Because the patterns also contain
+// `\s+(?!\S)`, `fancy_regex` matches them with its backtracking VM, which tries
+// the alternatives *in order* at every piece start. The contraction alternative
+// requires an apostrophe, so in ordinary prose it fails at essentially every
+// piece start, and every failure pays a full anchored `regex-automata` delegate
+// search plus the VM's stack push/pop and undo bookkeeping.
+//
+// `reorder_split_alternatives` moves the alternatives that actually match
+// ordinary text in front of that leading run. This is sound whenever the two
+// groups cannot match at the same position: the leading alternatives all start
+// with the same mandatory literal byte, and an alternative is only promoted when
+// it is *proven* it can never match a string starting with that byte. At most one
+// of the reordered alternatives can then match at any position, so ordered
+// alternation picks the same alternative as before, and the relative order inside
+// each group is preserved. Nothing follows the alternation, so a match of an
+// alternative is a match of the whole pattern.
+//
+// The analysis is deliberately conservative: anything it does not fully
+// understand (capture groups, back-references, `\G`/`\K`, lookaround, negated
+// classes or unknown escapes in the alternatives to promote) leaves the pattern
+// exactly as written.
+
+/// Splits a pattern into its top-level alternatives, or `None` if the pattern
+/// cannot be scanned confidently (unbalanced groups or classes).
+fn split_top_level_alternatives(pattern: &str) -> Option<Vec<&str>> {
+    let bytes = pattern.as_bytes();
+    let mut alternatives = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                // Skip the escaped byte; escapes never introduce structure here.
+                if i + 1 >= bytes.len() {
+                    return None;
+                }
+                i += 1;
+            }
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => depth += 1,
+            b')' if !in_class => depth = depth.checked_sub(1)?,
+            b'|' if !in_class && depth == 0 => {
+                alternatives.push(&pattern[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth != 0 || in_class {
+        return None;
+    }
+    alternatives.push(&pattern[start..]);
+    Some(alternatives)
+}
+
+/// True if `alternative` uses a construct that makes reordering unsafe:
+/// a capture group (reordering would renumber it), a back-reference, `\G` or
+/// `\K` (both are relative to where matching started).
+fn blocks_reordering(alternative: &str) -> bool {
+    let bytes = alternative.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                let Some(&next) = bytes.get(i + 1) else {
+                    return true;
+                };
+                if next.is_ascii_digit() || matches!(next, b'G' | b'K' | b'k') {
+                    return true;
+                }
+                i += 1;
+            }
+            // A `(` that is not immediately followed by `?` opens a capture
+            // group, and reordering would renumber it.
+            b'(' => match bytes.get(i + 1) {
+                Some(b'?') => match bytes.get(i + 2) {
+                    // Python-style named group or named back-reference.
+                    Some(b'P') => return true,
+                    // `(?<name>` captures, while `(?<=`/`(?<!` are lookbehind.
+                    Some(b'<') if !matches!(bytes.get(i + 3), Some(b'=') | Some(b'!')) => {
+                        return true;
+                    }
+                    // A bare flag setter such as `(?i)` applies to the rest of
+                    // the enclosing group, later alternatives included, so
+                    // moving it would change what they match.
+                    _ if is_bare_flag_group(&alternative[i..]) => return true,
+                    _ => {}
+                },
+                _ => return true,
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True for a flag setter with no body, such as `(?i)` or `(?-u)`, whose effect
+/// extends to the rest of the enclosing group.
+fn is_bare_flag_group(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("(?") else {
+        return false;
+    };
+    let mut saw_flag = false;
+    for c in rest.chars() {
+        match c {
+            ')' => return saw_flag,
+            'i' | 'm' | 's' | 'x' | 'u' | 'U' | 'R' | '-' => saw_flag = true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The literal character an alternative *must* start with, if it starts with an
+/// unquantified literal character. `None` for anything else.
+fn required_first_char(alternative: &str) -> Option<char> {
+    let (first, len) = literal_at(alternative)?;
+    // A quantifier would make the character optional or repeated, and `{` may
+    // start a bound we do not want to reason about.
+    if matches!(
+        alternative.as_bytes().get(len),
+        Some(b'?') | Some(b'*') | Some(b'{')
+    ) {
+        return None;
+    }
+    Some(first)
+}
+
+/// Parses a literal character (plain or backslash-escaped) at the start of `s`,
+/// returning the character and how many bytes it occupies.
+fn literal_at(s: &str) -> Option<(char, usize)> {
+    let mut chars = s.chars();
+    match chars.next()? {
+        '\\' => {
+            let escaped = chars.next()?;
+            // Only punctuation escapes are plain literals; `\d`, `\p{…}`, `\b`,
+            // … mean something else.
+            if escaped.is_ascii_punctuation() {
+                Some((escaped, 1 + escaped.len_utf8()))
+            } else {
+                None
+            }
+        }
+        c if !"\\^$.|?*+()[]{}".contains(c) => Some((c, c.len_utf8())),
+        _ => None,
+    }
+}
+
+/// A guard character we are willing to reason about: ASCII punctuation, which is
+/// never matched by `\p{L}`, `\p{N}`, `\p{M}`, `\d`, `\s` or `\w` (`_`, the one
+/// punctuation character `\w` accepts, is excluded).
+fn is_supported_guard(c: char) -> bool {
+    c.is_ascii_punctuation() && c != '_'
+}
+
+/// Reorders the top-level alternatives so the alternatives that can never match
+/// at the leading run's guard character are tried first. Returns `None` when no
+/// such reordering is provably safe.
+fn reorder_split_alternatives(pattern: &str) -> Option<String> {
+    let alternatives = split_top_level_alternatives(pattern)?;
+    if alternatives.len() < 3 || alternatives.iter().any(|a| blocks_reordering(a)) {
+        return None;
+    }
+
+    // The leading run: alternatives that all require the same literal character.
+    let guard = required_first_char(alternatives[0]).filter(|&c| is_supported_guard(c))?;
+    let lead_end = alternatives
+        .iter()
+        .position(|a| required_first_char(a) != Some(guard))
+        .unwrap_or(alternatives.len());
+
+    // The alternatives to promote: the ones right after the leading run that
+    // provably cannot match anything starting with `guard`.
+    let mut promote_end = lead_end;
+    while promote_end < alternatives.len() && cannot_start_with(alternatives[promote_end], guard) {
+        promote_end += 1;
+    }
+    if promote_end == lead_end {
+        return None;
+    }
+
+    let mut reordered = Vec::with_capacity(alternatives.len());
+    reordered.extend_from_slice(&alternatives[lead_end..promote_end]);
+    reordered.extend_from_slice(&alternatives[..lead_end]);
+    reordered.extend_from_slice(&alternatives[promote_end..]);
+    Some(reordered.join("|"))
+}
+
+/// Proves that `alternative` can only match strings whose first character is not
+/// `guard`. Conservative: returns `false` whenever it cannot prove it, including
+/// for alternatives that can match the empty string.
+fn cannot_start_with(alternative: &str, guard: char) -> bool {
+    let mut rest = alternative;
+    loop {
+        let Some((can_match_guard, atom_len)) = atom_can_match(rest, guard) else {
+            return false;
+        };
+        if can_match_guard {
+            return false;
+        }
+        let after_atom = &rest[atom_len..];
+        let Some((quantifier_len, optional)) = quantifier_at(after_atom) else {
+            return false;
+        };
+        if !optional {
+            // A mandatory atom that cannot match `guard` starts every match.
+            return true;
+        }
+        rest = &after_atom[quantifier_len..];
+        if rest.is_empty() {
+            // Everything was optional, so the alternative can match the empty
+            // string, which happens at a `guard` position too.
+            return false;
+        }
+    }
+}
+
+/// Parses the atom at the start of `s`, returning whether it can match `guard`
+/// and its length in bytes. `None` for anything not fully understood.
+fn atom_can_match(s: &str, guard: char) -> Option<(bool, usize)> {
+    if let Some(rest) = s.strip_prefix('[') {
+        // Character class. `[^…]` matches `guard` exactly when the listed set
+        // does not contain it.
+        let (negated, body) = match rest.strip_prefix('^') {
+            Some(body) => (true, body),
+            None => (false, rest),
+        };
+        let end = body.find(']')?;
+        let contains = class_contains(&body[..end], guard)?;
+        let len = s.len() - body.len() + end + 1;
+        Some((contains != negated, len))
+    } else if s.starts_with('\\') {
+        let (matches_guard, len) = escape_can_match(s, guard)?;
+        Some((matches_guard, len))
+    } else {
+        let (literal, len) = literal_at(s)?;
+        Some((literal == guard, len))
+    }
+}
+
+/// Whether a class escape (`\d`, `\p{L}`, …) or literal escape matches `guard`.
+fn escape_can_match(s: &str, guard: char) -> Option<(bool, usize)> {
+    let bytes = s.as_bytes();
+    match *bytes.get(1)? {
+        // Unicode classes. Only the categories that provably exclude ASCII
+        // punctuation are understood; `\P{…}` (negated) is not.
+        b'p' => {
+            let end = s.find('}')?;
+            let name = &s[3..end];
+            if *bytes.get(2)? != b'{' || !is_letter_or_number_class(name) {
+                return None;
+            }
+            Some((false, end + 1))
+        }
+        // Perl classes: none of them contains ASCII punctuation other than `_`,
+        // which `is_supported_guard` excludes.
+        b'd' | b'w' | b's' => Some((false, 2)),
+        // Their negations do match punctuation.
+        b'D' | b'W' | b'S' => Some((true, 2)),
+        _ => {
+            let (literal, len) = literal_at(s)?;
+            Some((literal == guard, len))
+        }
+    }
+}
+
+/// Unicode general categories (and shorthands) that contain no ASCII
+/// punctuation, so `\p{…}` with one of these can never match a guard character.
+fn is_letter_or_number_class(name: &str) -> bool {
+    matches!(
+        name,
+        "L" | "Letter"
+            | "Lu"
+            | "Ll"
+            | "Lt"
+            | "Lm"
+            | "Lo"
+            | "N"
+            | "Number"
+            | "Nd"
+            | "Nl"
+            | "No"
+            | "M"
+            | "Mark"
+            | "Mn"
+            | "Mc"
+            | "Me"
+            | "Alphabetic"
+    )
+}
+
+/// Whether a character class body contains `guard`. `None` if the body uses
+/// syntax this analysis does not understand.
+fn class_contains(body: &str, guard: char) -> Option<bool> {
+    let mut rest = body;
+    let mut contains = false;
+    while !rest.is_empty() {
+        if rest.starts_with('\\') {
+            let (matches_guard, len) = escape_can_match(rest, guard)?;
+            contains |= matches_guard;
+            rest = &rest[len..];
+            continue;
+        }
+        if rest.starts_with('[') {
+            // Nested classes and POSIX brackets are not understood.
+            return None;
+        }
+        let (low, low_len) = literal_at(rest)?;
+        let after_low = &rest[low_len..];
+        if let Some(range_rest) = after_low.strip_prefix('-') {
+            if range_rest.is_empty() {
+                // Trailing `-` is a literal.
+                contains |= guard == '-';
+                rest = range_rest;
+                continue;
+            }
+            let (high, high_len) = literal_at(range_rest)?;
+            contains |= low <= guard && guard <= high;
+            rest = &range_rest[high_len..];
+        } else {
+            contains |= low == guard;
+            rest = after_low;
+        }
+    }
+    Some(contains)
+}
+
+/// Parses a quantifier at the start of `s`, returning its length and whether it
+/// makes the preceding atom optional. `None` for a bound this analysis cannot
+/// read.
+fn quantifier_at(s: &str) -> Option<(usize, bool)> {
+    let bytes = s.as_bytes();
+    let (len, optional) = match bytes.first() {
+        Some(b'?') | Some(b'*') => (1, true),
+        Some(b'+') => (1, false),
+        Some(b'{') => {
+            let end = s.find('}')?;
+            let lower_bound = s[1..end].split(',').next()?.trim();
+            (end + 1, lower_bound == "0" || lower_bound.is_empty())
+        }
+        _ => return Some((0, false)),
+    };
+    // A lazy (`?`) or possessive (`+`) marker after the quantifier.
+    let len = match bytes.get(len) {
+        Some(b'?') | Some(b'+') => len + 1,
+        _ => len,
+    };
+    Some((len, optional))
+}
+
+/// Texts used to double-check that a reordered pattern splits exactly like the
+/// pattern as written before it is adopted.
+const SPLIT_PROBES: &[&str] = &[
+    "",
+    " ",
+    "  ",
+    "\n",
+    " \n\t ",
+    "a",
+    "A'",
+    " the quick brown fox jumps ",
+    "don't it's I'LL we've they're 'tis ''x '",
+    "'s't're've'm'll'd'",
+    "1 23 456 7890 0x12 3.14",
+    "hello, world! -- (yes) [no] {maybe}?",
+    "  leading and trailing whitespace   ",
+    "Ünïcödé çafé 中文字\u{3000}😀 a\u{301}b",
+    "tabs\tand\r\nnewlines\r\n\n  ",
+    "mixed123abc'sd 'x'y'z_ \u{a0}nbsp\u{2009}thin",
+];
+
+/// Whether two compiled patterns produce identical piece streams on the probes.
+fn splits_identically(as_written: &Regex, candidate: &Regex) -> bool {
+    SPLIT_PROBES.iter().all(|probe| {
+        let pieces = |re: &Regex| -> Vec<Option<std::ops::Range<usize>>> {
+            re.find_iter(probe)
+                .map(|m| m.ok().map(|m| m.range()))
+                .collect()
+        };
+        pieces(as_written) == pieces(candidate)
+    })
+}
+
 struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -683,13 +1076,30 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
+        // Compile the pattern as written first, so an invalid pattern is still rejected here, with
+        // the same error, before anything else happens.
+        let as_written = Regex::new(pattern)?;
+
+        // `fancy_regex` matches a pattern containing lookaround on its backtracking VM, which tries
+        // the top-level alternatives in order at every piece start. Both shipped patterns lead with
+        // the contraction alternative, which needs an apostrophe, so in ordinary text it fails at
+        // (almost) every piece start and each failure costs a delegated automaton search plus VM
+        // bookkeeping. Trying the alternatives that actually match first removes that work. The
+        // reordering is provably piece-for-piece equivalent (see `reorder_split_alternatives`) and
+        // is double-checked here before being adopted.
+        let reordered = reorder_split_alternatives(pattern).and_then(|rewritten| {
+            let candidate = Regex::new(&rewritten).ok()?;
+            splits_identically(&as_written, &candidate).then_some(rewritten)
+        });
+        let split_pattern: &str = reordered.as_deref().unwrap_or(pattern);
+
         // Compile an independent regex per thread-local slot instead of cloning one. Cloning a
         // `fancy_regex::Regex` shares an `Arc<Prog>` whose regex-automata engines keep their scratch
         // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
         // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
         // lock-free path), paying the compile cost once at construction rather than on the hot path.
         let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
+            .map(|_| Regex::new(split_pattern))
             .collect::<Result<Vec<_>, _>>()?;
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
@@ -725,7 +1135,7 @@ mod tests {
     use fancy_regex::Regex;
     use rustc_hash::FxHashMap as HashMap;
 
-    use crate::{Rank, byte_pair_split};
+    use crate::{Rank, byte_pair_split, reorder_split_alternatives, splits_identically};
 
     fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
         HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
@@ -743,5 +1153,76 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PATTERN: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    #[test]
+    fn test_r50k_pattern_is_reordered() {
+        assert_eq!(
+            reorder_split_alternatives(R50K_PATTERN).as_deref(),
+            Some(
+                r" ?\p{L}++| ?\p{N}++|'(?:[sdmt]|ll|ve|re)| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"
+            )
+        );
+    }
+
+    #[test]
+    fn test_patterns_without_a_provably_safe_promotion_are_left_alone() {
+        // cl100k's letter alternative starts with `[^\r\n\p{L}\p{N}]`, which
+        // matches an apostrophe, so nothing may be promoted past the
+        // contraction alternative. o200k does not lead with a literal at all.
+        assert_eq!(reorder_split_alternatives(CL100K_PATTERN), None);
+        assert_eq!(reorder_split_alternatives(O200K_PATTERN), None);
+    }
+
+    #[test]
+    fn test_reordering_refuses_unsupported_constructs() {
+        // Capture group (reordering would renumber it), back-reference, `\G`.
+        assert_eq!(reorder_split_alternatives(r"'a|(b)+|\p{L}+"), None);
+        assert_eq!(reorder_split_alternatives(r"'a|\1|\p{L}+"), None);
+        assert_eq!(reorder_split_alternatives(r"'a|\G\p{L}+|x"), None);
+        // Unbalanced pattern: not scanned at all.
+        assert_eq!(reorder_split_alternatives(r"'a|(?:b|\p{L}+"), None);
+        // The promotable candidate can match the guard character.
+        assert_eq!(reorder_split_alternatives(r"'a|.+|x"), None);
+        assert_eq!(reorder_split_alternatives(r"'a|[',]+|x"), None);
+        // Only optional atoms: matches the empty string, so it may match at an
+        // apostrophe too.
+        assert_eq!(reorder_split_alternatives(r"'a|\p{L}*|x"), None);
+        // A bare flag setter applies to every later alternative.
+        assert_eq!(reorder_split_alternatives(r"'a|\p{L}+|(?i)x|y"), None);
+    }
+
+    #[test]
+    fn test_reordered_pattern_splits_identically() {
+        let as_written = Regex::new(R50K_PATTERN).unwrap();
+        let reordered = Regex::new(&reorder_split_alternatives(R50K_PATTERN).unwrap()).unwrap();
+        assert!(splits_identically(&as_written, &reordered));
+
+        let texts = [
+            "don't stop believin'",
+            "''''s't 'll've're'm'd",
+            "It's 12:34, isn't it? -- yes'",
+            "  \n\ttabs 'n' spaces  ",
+            "Ünïcödé çafé's 中文字 😀 a\u{301}'s",
+            "'",
+            "'s",
+            "x'y'z",
+        ];
+        for text in texts {
+            let expected: Vec<_> = as_written
+                .find_iter(text)
+                .map(|m| m.unwrap().range())
+                .collect();
+            let actual: Vec<_> = reordered
+                .find_iter(text)
+                .map(|m| m.unwrap().range())
+                .collect();
+            assert_eq!(expected, actual, "piece streams differ for {text:?}");
+        }
     }
 }
