@@ -4,6 +4,8 @@ import base64
 import hashlib
 import os
 
+from tiktoken import _tiktoken
+
 
 def read_file(blobpath: str) -> bytes:
     if "://" not in blobpath:
@@ -107,41 +109,23 @@ def data_gym_to_mergeable_bpe_ranks(
 
     # vocab_bpe contains the merges along with associated ranks
     vocab_bpe_contents = read_file_cached(vocab_bpe_file, vocab_bpe_hash).decode()
-    bpe_merges = [tuple(merge_str.split()) for merge_str in vocab_bpe_contents.split("\n")[1:-1]]
+    # the encoder json spells out the same table; it is used to check that the merges file
+    # agrees with it. this sanity check is important since tiktoken assumes that ranks are
+    # ordered the same as merge priority
+    encoder_json_contents = read_file_cached(encoder_json_file, encoder_json_hash)
 
-    def decode_data_gym(value: str) -> bytes:
-        return bytes(data_gym_byte_to_byte[b] for b in value)
-
-    # add the single byte tokens
-    # if clobber_one_byte_tokens is True, we'll replace these with ones from the encoder json
-    bpe_ranks = {bytes([b]): i for i, b in enumerate(rank_to_intbyte)}
-    del rank_to_intbyte
-
-    # add the merged tokens
-    n = len(bpe_ranks)
-    for first, second in bpe_merges:
-        bpe_ranks[decode_data_gym(first) + decode_data_gym(second)] = n
-        n += 1
-
-    import json
-
-    # check that the encoder file matches the merges file
-    # this sanity check is important since tiktoken assumes that ranks are ordered the same
-    # as merge priority
-    encoder_json = json.loads(read_file_cached(encoder_json_file, encoder_json_hash))
-    encoder_json_loaded = {decode_data_gym(k): v for k, v in encoder_json.items()}
-    # drop these two special tokens if present, since they're not mergeable bpe tokens
-    encoder_json_loaded.pop(b"<|endoftext|>", None)
-    encoder_json_loaded.pop(b"<|startoftext|>", None)
-
-    if clobber_one_byte_tokens:
-        for k in encoder_json_loaded:
-            if len(k) == 1:
-                bpe_ranks[k] = encoder_json_loaded[k]
-
-    assert bpe_ranks == encoder_json_loaded
-
-    return bpe_ranks
+    # Both files write a token's bytes as one printable character per byte, so building the
+    # table means decoding ~150k of those characters (two per merge, plus one per encoder json
+    # key). Done here that was a dict lookup per character inside a generator; the core does it
+    # with a flat table, and checks the encoder json while streaming it instead of building a
+    # second, throwaway table to compare against.
+    return _tiktoken.data_gym_mergeable_ranks(
+        data_gym_byte_to_byte,
+        rank_to_intbyte,
+        vocab_bpe_contents,
+        encoder_json_contents,
+        clobber_one_byte_tokens,
+    )
 
 
 def dump_tiktoken_bpe(bpe_ranks: dict[bytes, int], tiktoken_bpe_file: str) -> None:
