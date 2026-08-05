@@ -259,6 +259,20 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
+/// Where the tokeniser split should resume after `mat`.
+///
+/// The split patterns can never match empty, but a caller-supplied pattern
+/// could, so step over an empty match to keep the scan making progress (this is
+/// what `fancy_regex::Matches` does too).
+#[inline]
+fn piece_scan_next_pos(text: &str, mat: &fancy_regex::Match<'_>) -> usize {
+    if mat.end() > mat.start() {
+        mat.end()
+    } else {
+        mat.end() + text[mat.end()..].chars().next().map_or(1, char::len_utf8)
+    }
+}
+
 struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -380,8 +394,22 @@ impl CoreBPE {
         // just make things complicated :-)
         let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        // Scan the pieces ourselves instead of with `Regex::find_iter`, which
+        // keeps searching after a match that ended at the end of the haystack.
+        // That last search must fail, and a failing search is the most
+        // expensive kind there is for a split pattern: every alternative gets
+        // tried (each one a backtrack-stack push plus at least one delegated
+        // automaton search) before the engine can conclude there is nothing
+        // left. It costs the same as several successful matches, and it is paid
+        // on every call, so short inputs pay it over and over.
+        let mut pos = 0;
+        while pos < text.len() {
+            let mat = match regex.find_from_pos(text, pos).unwrap() {
+                Some(mat) => mat,
+                None => break,
+            };
+            pos = piece_scan_next_pos(text, &mat);
+            let piece = mat.as_str().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -420,15 +448,20 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
+            // (including why the pieces are scanned without `find_iter`)
+            let chunk = &text[start..end];
+            let mut pos = 0;
+            while pos < chunk.len() {
+                let mat = match regex.find_from_pos(chunk, pos) {
+                    Ok(Some(m)) => m,
+                    Ok(None) => break,
                     Err(e) => {
                         return Err(EncodeError {
                             message: format!("Regex error while tokenizing: {e}"),
                         });
                     }
                 };
+                pos = piece_scan_next_pos(chunk, &mat);
 
                 let piece = mat.as_str().as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
@@ -743,5 +776,54 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    /// The piece scan used by `encode`/`encode_ordinary` must yield exactly what
+    /// `Regex::find_iter` yields; it only skips the trailing failing search.
+    #[test]
+    fn test_piece_scan_matches_find_iter() {
+        const R50K: &str =
+            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+        const CL100K: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+
+        let texts = [
+            "",
+            "a",
+            " ",
+            "hello world",
+            "The quick brown fox jumps over the lazy dog.",
+            "trailing space ",
+            "double  space",
+            "tabs\tand\nnewlines\r\n\r\n",
+            "  leading whitespace",
+            "don't stop, it's 42 apples (BPE) 1234567",
+            "héllo wörld ✨ 日本語のテキスト",
+            "mixed123abc456 ...!!!??? ",
+            "\n\n\n",
+            "ends mid-wor",
+        ];
+
+        for pattern in [R50K, CL100K] {
+            let regex = Regex::new(pattern).unwrap();
+            for text in texts {
+                let expected: Vec<&str> = regex
+                    .find_iter(text)
+                    .map(|mat| mat.unwrap().as_str())
+                    .collect();
+
+                let mut actual: Vec<&str> = Vec::new();
+                let mut pos = 0;
+                while pos < text.len() {
+                    let mat = match regex.find_from_pos(text, pos).unwrap() {
+                        Some(mat) => mat,
+                        None => break,
+                    };
+                    pos = crate::piece_scan_next_pos(text, &mat);
+                    actual.push(mat.as_str());
+                }
+
+                assert_eq!(expected, actual, "pattern {pattern:?}, text {text:?}");
+            }
+        }
     }
 }
