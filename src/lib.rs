@@ -138,9 +138,28 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
 }
 
 fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
+    let mut parts = Vec::new();
+    _byte_pair_merge_into(ranks, piece, &mut parts);
+    parts
+}
+
+/// Same as [`_byte_pair_merge`], but writes the token boundaries into `parts`
+/// instead of returning a fresh vector.
+///
+/// The encode hot loop runs the merges once per piece that is not a token of
+/// its own, and the working vector was allocated (and freed) on every one of
+/// those pieces. Letting the caller own the buffer means it is allocated once
+/// per `encode` call and stays hot in cache for every subsequent piece; the
+/// contents produced are unchanged.
+fn _byte_pair_merge_into(
+    ranks: &HashMap<Vec<u8>, Rank>,
+    piece: &[u8],
+    parts: &mut Vec<(usize, Rank)>,
+) {
     // This is a vector of (start, rank).
     // The rank is of the pair starting at position start.
-    let mut parts = Vec::with_capacity(piece.len() + 1);
+    parts.clear();
+    parts.reserve(piece.len() + 1);
 
     // Note that we hash bytes when indexing into `ranks`, not token pairs. As long as we train BPE
     // the way we currently do, this is equivalent. An easy way to break this would be to decouple
@@ -180,9 +199,9 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
         // Update parts[i] and parts[i - 1] before removing parts[i + 1], since
         // `parts.remove(i + 1)` will thrash the cache.
         if i > 0 {
-            parts[i - 1].1 = get_rank(&parts, i - 1);
+            parts[i - 1].1 = get_rank(parts, i - 1);
         }
-        parts[i].1 = get_rank(&parts, i);
+        parts[i].1 = get_rank(parts, i);
         parts.remove(i + 1);
 
         min_rank = (Rank::MAX, usize::MAX);
@@ -192,17 +211,32 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
             }
         }
     }
-    parts
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+    byte_pair_encode_with_scratch(piece, ranks, &mut Vec::new())
+}
+
+/// Same as [`byte_pair_encode`], but runs the merges in a caller-owned
+/// workspace.
+///
+/// `encode`/`encode_ordinary` call this once per piece that is not already a
+/// token, so passing the same `scratch` in for every piece replaces one
+/// allocate/free pair per piece with a single allocation per call. The returned
+/// tokens are identical to [`byte_pair_encode`]'s.
+fn byte_pair_encode_with_scratch(
+    piece: &[u8],
+    ranks: &HashMap<Vec<u8>, Rank>,
+    scratch: &mut Vec<(usize, Rank)>,
+) -> Vec<Rank> {
     let piece_len = piece.len();
 
     if piece_len == 1 {
         return vec![ranks[piece]];
     }
     if piece_len < 100 {
-        return _byte_pair_merge(ranks, piece)
+        _byte_pair_merge_into(ranks, piece, scratch);
+        return scratch
             .windows(2)
             .map(|part| ranks[&piece[part[0].0..part[1].0]])
             .collect();
@@ -380,11 +414,18 @@ impl CoreBPE {
         // just make things complicated :-)
         let regex = self._get_tl_regex();
         let mut ret = vec![];
+        // One merge workspace for the whole call, reused by every piece that
+        // needs the byte-pair merges (see `byte_pair_encode_with_scratch`).
+        let mut scratch = Vec::new();
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
-                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+                None => ret.extend(&byte_pair_encode_with_scratch(
+                    piece,
+                    &self.encoder,
+                    &mut scratch,
+                )),
             }
         }
         ret
@@ -398,6 +439,8 @@ impl CoreBPE {
         let special_regex = self._get_tl_special_regex();
         let regex = self._get_tl_regex();
         let mut ret = vec![];
+        // See `encode_ordinary`: one merge workspace for the whole call.
+        let mut scratch = Vec::new();
 
         let mut start = 0;
         let mut last_piece_token_len = 0;
@@ -436,7 +479,7 @@ impl CoreBPE {
                     ret.push(*token);
                     continue;
                 }
-                let tokens = byte_pair_encode(piece, &self.encoder);
+                let tokens = byte_pair_encode_with_scratch(piece, &self.encoder, &mut scratch);
                 last_piece_token_len = tokens.len();
                 ret.extend(&tokens);
             }
