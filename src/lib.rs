@@ -259,6 +259,89 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
+/// Yields the byte range of every piece the split pattern matches in
+/// `haystack`, in the same order and with the same boundaries as
+/// `Regex::find_iter`.
+///
+/// The split runs once per token, so `fancy_regex`'s own `Matches` iterator is
+/// a measurable part of encoding: on every step it recomputes the `\G`-related
+/// option flag from its `last_match` state, wraps the result in
+/// `Option<Result<Match<'t>>>`, and hands back a `Match` whose `as_str()` walks
+/// the haystack again to re-validate the UTF-8 boundaries that the match
+/// already guarantees. This keeps only the part the split needs: the byte
+/// range, taken straight from the match, plus the empty-match progress rules
+/// that `Matches` applies.
+struct SplitPieces<'r, 'h> {
+    regex: &'r Regex,
+    haystack: &'h str,
+    /// Where the next search starts (`> haystack.len()` once exhausted).
+    pos: usize,
+    /// End of the previous match, or `usize::MAX` if there was none. Used to
+    /// drop an empty match that sits right where the last match ended, which is
+    /// what `Matches` does.
+    last_match_end: usize,
+}
+
+impl<'r, 'h> SplitPieces<'r, 'h> {
+    #[inline]
+    fn new(regex: &'r Regex, haystack: &'h str) -> Self {
+        SplitPieces {
+            regex,
+            haystack,
+            pos: 0,
+            last_match_end: usize::MAX,
+        }
+    }
+
+    /// Returns the next piece as a byte range, or `None` once the haystack is
+    /// exhausted. Regex errors are handed to the caller, like `find_iter` does,
+    /// and end the iteration.
+    #[inline]
+    fn next_range(&mut self) -> Option<Result<std::ops::Range<usize>, fancy_regex::Error>> {
+        loop {
+            if self.pos > self.haystack.len() {
+                return None;
+            }
+            let (start, end) = match self.regex.find_from_pos(self.haystack, self.pos) {
+                Ok(Some(m)) => (m.start(), m.end()),
+                Ok(None) => return None,
+                Err(e) => {
+                    // Stop on the first error, as `Matches` does.
+                    self.pos = self.haystack.len() + 1;
+                    return Some(Err(e));
+                }
+            };
+            if start == end {
+                // An empty match has to make progress, so resume at the next
+                // codepoint; and an empty match immediately following a match
+                // is not reported at all.
+                self.pos = next_codepoint(self.haystack, end);
+                let repeat = self.last_match_end == end;
+                self.last_match_end = end;
+                if repeat {
+                    continue;
+                }
+            } else {
+                self.pos = end;
+                self.last_match_end = end;
+            }
+            return Some(Ok(start..end));
+        }
+    }
+}
+
+/// Byte index of the codepoint following the one starting at `i`, saturating at
+/// the end of `text`.
+#[inline]
+fn next_codepoint(text: &str, i: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = i + 1;
+    while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+        i += 1;
+    }
+    i
+}
+
 struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -379,9 +462,11 @@ impl CoreBPE {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
         let regex = self._get_tl_regex();
+        let bytes = text.as_bytes();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        let mut pieces = SplitPieces::new(regex, text);
+        while let Some(range) = pieces.next_range() {
+            let piece = &bytes[range.unwrap()];
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -420,9 +505,12 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
+            let haystack = &text[start..end];
+            let haystack_bytes = haystack.as_bytes();
+            let mut pieces = SplitPieces::new(regex, haystack);
+            while let Some(range_res) = pieces.next_range() {
+                let range = match range_res {
+                    Ok(r) => r,
                     Err(e) => {
                         return Err(EncodeError {
                             message: format!("Regex error while tokenizing: {e}"),
@@ -430,7 +518,7 @@ impl CoreBPE {
                     }
                 };
 
-                let piece = mat.as_str().as_bytes();
+                let piece = &haystack_bytes[range];
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
                     ret.push(*token);
@@ -725,10 +813,64 @@ mod tests {
     use fancy_regex::Regex;
     use rustc_hash::FxHashMap as HashMap;
 
-    use crate::{Rank, byte_pair_split};
+    use crate::{Rank, SplitPieces, byte_pair_split};
 
     fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
         HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
+    }
+
+    /// `SplitPieces` must hand back exactly the pieces `Regex::find_iter`
+    /// does, including its empty-match rules, for the patterns tiktoken ships
+    /// and for pattern shapes that can match the empty string.
+    #[test]
+    fn test_split_pieces_matches_find_iter() {
+        let patterns = [
+            // r50k / gpt2
+            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s",
+            // cl100k
+            r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s",
+            // patterns that can match the empty string, to cover the
+            // empty-match progress and de-duplication rules
+            r"a*",
+            r"x?",
+        ];
+        let texts = [
+            "",
+            " ",
+            "\n",
+            "  ",
+            "\n\n\n",
+            "a",
+            "'s and 'T",
+            "don't stop",
+            "123 4567",
+            "  leading and trailing   ",
+            "naïve café 中文 😀 e\u{0301}",
+            "aaa bbb\u{00a0}ccc",
+            "x y xx",
+        ];
+        for pattern in patterns {
+            let re = Regex::new(pattern).unwrap();
+            for text in texts {
+                let expected: Vec<(usize, usize)> = re
+                    .find_iter(text)
+                    .map(|m| {
+                        let m = m.unwrap();
+                        (m.start(), m.end())
+                    })
+                    .collect();
+                let mut pieces = SplitPieces::new(&re, text);
+                let mut actual = Vec::new();
+                while let Some(range) = pieces.next_range() {
+                    let range = range.unwrap();
+                    actual.push((range.start, range.end));
+                }
+                assert_eq!(
+                    expected, actual,
+                    "pieces differ for pattern {pattern:?} on text {text:?}"
+                );
+            }
+        }
     }
 
     #[test]
