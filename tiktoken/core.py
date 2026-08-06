@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
 
@@ -338,16 +339,30 @@ class Encoding:
         self, batch: Sequence[Sequence[int]], *, errors: str = "replace", num_threads: int = 8
     ) -> list[str]:
         """Decodes a batch (list of lists of tokens) into a list of strings."""
-        decoder = functools.partial(self.decode, errors=errors)
-        with ThreadPoolExecutor(num_threads) as e:
-            return list(e.map(decoder, batch))
+        return [
+            token_bytes.decode("utf-8", errors=errors)
+            for token_bytes in self.decode_bytes_batch(batch, num_threads=num_threads)
+        ]
 
     def decode_bytes_batch(
         self, batch: Sequence[Sequence[int]], *, num_threads: int = 8
     ) -> list[bytes]:
         """Decodes a batch (list of lists of tokens) into a list of bytes."""
-        with ThreadPoolExecutor(num_threads) as e:
-            return list(e.map(self.decode_bytes, batch))
+        # The whole batch is decoded in one call into the core, which reads the
+        # token ids and then resolves them to bytes with the GIL released. On a
+        # GIL-enabled build that is strictly faster than spreading the batch
+        # over a thread pool, since only one thread can read token ids at a time
+        # and the per-task overhead is larger than decoding a sequence.
+        if _threads_can_decode_in_parallel() and num_threads > 1 and len(batch) > 1:
+            chunk_size = -(-len(batch) // num_threads)
+            chunks = [batch[i : i + chunk_size] for i in range(0, len(batch), chunk_size)]
+            with ThreadPoolExecutor(num_threads) as e:
+                return [
+                    token_bytes
+                    for chunk in e.map(self._core_bpe.decode_bytes_batch, chunks)
+                    for token_bytes in chunk
+                ]
+        return self._core_bpe.decode_bytes_batch(batch)
 
     # ====================
     # Miscellaneous
@@ -426,6 +441,17 @@ class Encoding:
             self.__dict__ = tiktoken.registry.get_encoding(value).__dict__
             return
         self.__init__(**value)
+
+
+def _threads_can_decode_in_parallel() -> bool:
+    """Whether Python threads can decode batches in parallel.
+
+    Reading token ids requires the interpreter, so on a GIL-enabled build a
+    thread pool only adds per-task overhead to batch decoding. On a
+    free-threaded build the threads do overlap, so the batch is spread over them.
+    """
+    is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
+    return is_gil_enabled is not None and not is_gil_enabled()
 
 
 @functools.lru_cache(maxsize=128)

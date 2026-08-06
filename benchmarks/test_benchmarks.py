@@ -88,3 +88,19 @@ def test_encode_ordinary_batch(benchmark, encoding_name: str) -> None:
     documents = [TEXT_SIZES["medium"]] * 64
     result = benchmark(functools.partial(enc.encode_ordinary_batch, num_threads=4), documents)
     assert len(result) == len(documents)
+
+
+@pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
+def test_decode_batch(benchmark, encoding_name: str) -> None:
+    enc = _get_encoding(encoding_name)
+    batch = [enc.encode_ordinary(TEXT_SIZES["medium"])] * 64
+    result = benchmark(functools.partial(enc.decode_batch, num_threads=4), batch)
+    assert len(result) == len(batch)
+
+
+@pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
+def test_decode_bytes_batch(benchmark, encoding_name: str) -> None:
+    enc = _get_encoding(encoding_name)
+    batch = [enc.encode_ordinary(TEXT_SIZES["medium"])] * 64
+    result = benchmark(functools.partial(enc.decode_bytes_batch, num_threads=4), batch)
+    assert len(result) == len(batch)

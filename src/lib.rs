@@ -375,6 +375,33 @@ impl CoreBPE {
         Ok(ret)
     }
 
+    /// Decodes a batch of token sequences, flattened into `tokens` with one
+    /// entry per sequence in `counts`, into a single contiguous byte buffer
+    /// plus the byte length of every sequence.
+    ///
+    /// Decoding a whole batch in one call is what lets the caller pay the
+    /// Python-side per-item cost (a function call, a future, a GIL handoff)
+    /// once for the batch instead of once per sequence.
+    fn decode_bytes_batch(
+        &self,
+        tokens: &[Rank],
+        counts: &[usize],
+    ) -> Result<(Vec<u8>, Vec<usize>), DecodeKeyError> {
+        let mut ret = Vec::with_capacity(tokens.len() * 2);
+        let mut lengths = Vec::with_capacity(counts.len());
+        let mut start = 0;
+        for &count in counts {
+            let before = ret.len();
+            for &token in &tokens[start..start + count] {
+                let token_bytes = self.token_bytes(token).ok_or(DecodeKeyError { token })?;
+                ret.extend(token_bytes);
+            }
+            start += count;
+            lengths.push(ret.len() - before);
+        }
+        Ok((ret, lengths))
+    }
+
     pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)

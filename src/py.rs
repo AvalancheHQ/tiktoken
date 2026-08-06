@@ -199,6 +199,53 @@ impl CoreBPE {
         }
     }
 
+    /// Decodes a batch of token sequences into a list of `bytes`.
+    ///
+    /// Doing the whole batch in one call keeps the Python-side cost (a call, a
+    /// future, a GIL handoff per sequence) off the per-sequence path: the token
+    /// ids of every sequence are read once, the bytes are resolved with the GIL
+    /// released, and the resulting `bytes` objects are built in one pass.
+    #[pyo3(name = "decode_bytes_batch")]
+    fn py_decode_bytes_batch(&self, py: Python, batch: &Bound<'_, PyAny>) -> PyResult<Py<PyList>> {
+        // Read every token id up front, flattened, with the number of tokens of
+        // each sequence, so the decoding itself needs no Python objects.
+        let mut tokens: Vec<Rank> = Vec::new();
+        let mut counts: Vec<usize> = Vec::new();
+        if let Ok(list) = batch.downcast::<PyList>() {
+            counts.reserve(list.len());
+            // Every sequence that is a `list` knows its length, so the whole
+            // flattened buffer can be sized up front instead of being grown
+            // (and copied) once per sequence.
+            tokens.reserve(
+                list.iter()
+                    .map(|item| item.downcast::<PyList>().map_or(0, |seq| seq.len()))
+                    .sum(),
+            );
+            for item in list.iter() {
+                read_sequence(&item, &mut tokens, &mut counts)?;
+            }
+        } else {
+            for item in batch.try_iter()? {
+                read_sequence(&item?, &mut tokens, &mut counts)?;
+            }
+        }
+
+        let (bytes, lengths) = py
+            .detach(|| self.decode_bytes_batch(&tokens, &counts))
+            .map_err(|e| pyo3::exceptions::PyKeyError::new_err(format!("{}", e)))?;
+
+        let mut offset = 0usize;
+        let decoded = PyList::new(
+            py,
+            lengths.iter().map(|&length| {
+                let piece = PyBytes::new(py, &bytes[offset..offset + length]);
+                offset += length;
+                piece
+            }),
+        )?;
+        Ok(decoded.into())
+    }
+
     fn decode_single_token_bytes(&self, py: Python, token: Rank) -> PyResult<Py<PyBytes>> {
         if let Some(bytes) = self.decoder.get(&token) {
             return Ok(PyBytes::new(py, bytes).into());
@@ -219,6 +266,27 @@ impl CoreBPE {
             .map(|x| PyBytes::new(py, x).into())
             .collect()
     }
+}
+
+/// Read the token ids of one sequence of a batch, appending them to `tokens` and
+/// recording how many were appended in `counts`.
+fn read_sequence(
+    item: &Bound<'_, PyAny>,
+    tokens: &mut Vec<Rank>,
+    counts: &mut Vec<usize>,
+) -> PyResult<()> {
+    let before = tokens.len();
+    if let Ok(list) = item.downcast::<PyList>() {
+        tokens.reserve(list.len());
+        for token in list.iter() {
+            tokens.push(read_rank(&token)?);
+        }
+    } else {
+        // Any other sequence keeps the generic extraction path.
+        tokens.extend(item.extract::<Vec<Rank>>()?);
+    }
+    counts.push(tokens.len() - before);
+    Ok(())
 }
 
 /// Read a token id from a Python object, reading a plain in-range `int` with a
