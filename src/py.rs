@@ -242,6 +242,11 @@ impl CoreBPE {
     /// Returns `None` when `tokens` is not such a buffer, or when one of its
     /// values does not fit a token id, so the caller falls back to the generic
     /// extraction path and its exact error behaviour is preserved.
+    ///
+    /// Kept out of line: inlining it (and the four `decode_from_buffer`
+    /// instantiations it fans out to) into `py_decode_bytes` more than doubles
+    /// that function's code size and measurably slows the `list` fast path.
+    #[inline(never)]
     fn decode_int_buffer(
         &self,
         py: Python<'_>,
