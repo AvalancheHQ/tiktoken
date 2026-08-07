@@ -115,13 +115,22 @@ class Encoding:
         """
         if allowed_special == "all":
             allowed_special = self.special_tokens_set
-        if disallowed_special == "all":
-            disallowed_special = self.special_tokens_set - allowed_special
-        if disallowed_special:
-            if not isinstance(disallowed_special, frozenset):
-                disallowed_special = frozenset(disallowed_special)
-            if match := _special_token_regex(disallowed_special).search(text):
+        if disallowed_special == "all" and not allowed_special:
+            # Fast path for the default call shape: "disallow every special token".
+            # It always resolves to the same matcher, which is compiled once per
+            # `Encoding` instead of rebuilding a set, a frozenset and a fresh
+            # lru_cache key on every call.
+            special_regex = self._all_disallowed_special_regex
+            if special_regex is not None and (match := special_regex.search(text)):
                 raise_disallowed_special_token(match.group())
+        else:
+            if disallowed_special == "all":
+                disallowed_special = self.special_tokens_set - allowed_special
+            if disallowed_special:
+                if not isinstance(disallowed_special, frozenset):
+                    disallowed_special = frozenset(disallowed_special)
+                if match := _special_token_regex(disallowed_special).search(text):
+                    raise_disallowed_special_token(match.group())
 
         try:
             return self._core_bpe.encode(text, allowed_special)
@@ -148,13 +157,22 @@ class Encoding:
         """
         if allowed_special == "all":
             allowed_special = self.special_tokens_set
-        if disallowed_special == "all":
-            disallowed_special = self.special_tokens_set - allowed_special
-        if disallowed_special:
-            if not isinstance(disallowed_special, frozenset):
-                disallowed_special = frozenset(disallowed_special)
-            if match := _special_token_regex(disallowed_special).search(text):
+        if disallowed_special == "all" and not allowed_special:
+            # Fast path for the default call shape: "disallow every special token".
+            # It always resolves to the same matcher, which is compiled once per
+            # `Encoding` instead of rebuilding a set, a frozenset and a fresh
+            # lru_cache key on every call.
+            special_regex = self._all_disallowed_special_regex
+            if special_regex is not None and (match := special_regex.search(text)):
                 raise_disallowed_special_token(match.group())
+        else:
+            if disallowed_special == "all":
+                disallowed_special = self.special_tokens_set - allowed_special
+            if disallowed_special:
+                if not isinstance(disallowed_special, frozenset):
+                    disallowed_special = frozenset(disallowed_special)
+                if match := _special_token_regex(disallowed_special).search(text):
+                    raise_disallowed_special_token(match.group())
 
         import numpy as np
 
@@ -232,13 +250,22 @@ class Encoding:
         """
         if allowed_special == "all":
             allowed_special = self.special_tokens_set
-        if disallowed_special == "all":
-            disallowed_special = self.special_tokens_set - allowed_special
-        if disallowed_special:
-            if not isinstance(disallowed_special, frozenset):
-                disallowed_special = frozenset(disallowed_special)
-            if match := _special_token_regex(disallowed_special).search(text):
+        if disallowed_special == "all" and not allowed_special:
+            # Fast path for the default call shape: "disallow every special token".
+            # It always resolves to the same matcher, which is compiled once per
+            # `Encoding` instead of rebuilding a set, a frozenset and a fresh
+            # lru_cache key on every call.
+            special_regex = self._all_disallowed_special_regex
+            if special_regex is not None and (match := special_regex.search(text)):
                 raise_disallowed_special_token(match.group())
+        else:
+            if disallowed_special == "all":
+                disallowed_special = self.special_tokens_set - allowed_special
+            if disallowed_special:
+                if not isinstance(disallowed_special, frozenset):
+                    disallowed_special = frozenset(disallowed_special)
+                if match := _special_token_regex(disallowed_special).search(text):
+                    raise_disallowed_special_token(match.group())
 
         return self._core_bpe.encode_with_unstable(text, allowed_special)
 
@@ -364,6 +391,17 @@ class Encoding:
     @functools.cached_property
     def special_tokens_set(self) -> set[str]:
         return set(self._special_tokens.keys())
+
+    @functools.cached_property
+    def _all_disallowed_special_regex(self) -> re.Pattern[str] | None:
+        """Matcher for "every special token", the default `disallowed_special`.
+
+        `None` when the encoding has no special tokens, in which case nothing can be
+        disallowed and the check is skipped entirely.
+        """
+        if not self._special_tokens:
+            return None
+        return _special_token_regex(frozenset(self._special_tokens))
 
     def is_special_token(self, token: int) -> bool:
         assert isinstance(token, int)
