@@ -5,6 +5,7 @@ use std::thread;
 use fancy_regex::Regex;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+use regex::Regex as FastRegex;
 use rustc_hash::FxHashMap as HashMap;
 
 #[cfg(feature = "python")]
@@ -218,6 +219,417 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> V
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Tokeniser split
+// ---------------------------------------------------------------------------
+
+/// The leading run of top-level alternatives of a split pattern that the `regex`
+/// crate can run on its own, compiled as a single automaton.
+///
+/// `fancy_regex` has to interpret the tokeniser patterns on its backtracking VM,
+/// because they use possessive quantifiers and the `\s+(?!\S)` lookahead. It pays
+/// the VM's fixed cost — a fresh match state, save/restore bookkeeping and a
+/// delegated automaton search per alternative it tries — for *every piece*, and a
+/// piece is a handful of bytes.
+///
+/// The alternatives that produce nearly every piece of real text need none of
+/// that: they are plain regex syntax once the possessive markers are dropped.
+/// Running them through `regex::Regex::find_iter` walks the whole document in a
+/// single streaming search that yields piece after piece, so a regex engine is
+/// entered once per *document* instead of once per piece. `fancy_regex` stays the
+/// source of truth and decides every position the fast automaton does not match
+/// (whitespace runs, the `\s++$` and `\s+(?!\S)` alternatives).
+#[derive(Clone)]
+struct FastSplit {
+    regex: FastRegex,
+}
+
+impl FastSplit {
+    /// Derives the fast splitter for `pattern`, or `None` if it cannot be shown
+    /// to split exactly like `fancy`.
+    fn new(pattern: &str, fancy: &Regex) -> Option<FastSplit> {
+        // `\G`/`\K` depend on where the search started, and `fancy_regex`'s own
+        // iterator feeds extra option flags into the VM for them. Leave any such
+        // pattern alone entirely.
+        if pattern.contains("\\G") || pattern.contains("\\K") {
+            return None;
+        }
+
+        // Take the *leading* run of alternatives the `regex` crate can run: since
+        // alternation is ordered, if one of them matches at a position then the
+        // full pattern matches there with the very same alternative.
+        let mut fast: Vec<String> = Vec::new();
+        for alt in top_level_alternatives(pattern)? {
+            match regex_crate_alternative(alt) {
+                Some(relaxed) => fast.push(relaxed),
+                None => break,
+            }
+        }
+        if fast.is_empty() {
+            return None;
+        }
+
+        let regex = FastRegex::new(&fast.join("|")).ok()?;
+        // An alternative that can match the empty string would need `find_iter`'s
+        // empty-match rules to be mirrored on the fast path too; refuse instead.
+        if regex.is_match("") {
+            return None;
+        }
+
+        let split = FastSplit { regex };
+        if !split.splits_like(fancy) {
+            return None;
+        }
+        Some(split)
+    }
+
+    /// Checks that the fast path yields exactly the pieces `fancy.find_iter`
+    /// yields, over a corpus covering every character class the tokeniser
+    /// patterns distinguish.
+    fn splits_like(&self, fancy: &Regex) -> bool {
+        // Pieces of text that the split patterns treat differently: the three
+        // kinds of whitespace run, letters (cased and uncased), digits, the
+        // contraction apostrophe, symbols, and non-ASCII of each relevant class.
+        const ATOMS: [&str; 14] = [
+            " ", "  ", "\t", "\n", "\r\n", "a", "A", "0", "'", "!", "é", "中", "\u{a0}", "\u{0301}",
+        ];
+        const EXTRA: [&str; 8] = [
+            "",
+            "The quick brown fox jumps over the lazy dog.",
+            "It's a test, isn't it? 42 apples\n\nand 1,000 oranges.",
+            "trailing spaces   ",
+            "\n\n\n",
+            "  leading",
+            "ЖЖ ЖЖ 漢字テスト",
+            "emoji 🙂🙃 and combining a\u{0301}e\u{0301}",
+        ];
+
+        let mut probes: Vec<String> = EXTRA.iter().map(|s| (*s).to_owned()).collect();
+        for a in ATOMS {
+            probes.push(a.to_owned());
+            for b in ATOMS {
+                probes.push(format!("{a}{b}"));
+                for c in ATOMS {
+                    probes.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+
+        probes.iter().all(|probe| {
+            let expected: Result<Vec<&str>, _> = fancy
+                .find_iter(probe)
+                .map(|res| res.map(|mat| mat.as_str()))
+                .collect();
+            let actual: Result<Vec<&str>, _> = FastPieces::new(probe, fancy, &self.regex).collect();
+            match (expected, actual) {
+                (Ok(expected), Ok(actual)) => expected == actual,
+                (Err(_), Err(_)) => true,
+                _ => false,
+            }
+        })
+    }
+}
+
+/// Splits `pattern` into its top-level alternatives, or `None` if the scanner
+/// does not fully understand its structure.
+fn top_level_alternatives(pattern: &str) -> Option<Vec<&str>> {
+    let bytes = pattern.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => depth += 1,
+            b')' if !in_class => depth = depth.checked_sub(1)?,
+            b'|' if !in_class && depth == 0 => {
+                parts.push(&pattern[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_class || depth != 0 {
+        return None;
+    }
+    parts.push(&pattern[start..]);
+    Some(parts)
+}
+
+/// Rewrites one top-level alternative into the equivalent form the `regex` crate
+/// accepts, or `None` if it uses a construct that has to stay with `fancy_regex`.
+///
+/// The only rewrite is dropping possessive markers (`++`, `?+`, `*+`, `{n,m}+`),
+/// which `regex` has no syntax for. That is not equivalence-preserving in
+/// general, which is exactly why the result is verified against `fancy_regex`
+/// before it is used (see [`FastSplit::splits_like`]).
+fn regex_crate_alternative(alt: &str) -> Option<String> {
+    let bytes = alt.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_class = false;
+    // Whether the token just copied was a quantifier, in which case a following
+    // `+` is a possessive marker rather than a quantifier of its own.
+    let mut after_quantifier = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_class {
+            if b == b'\\' {
+                out.extend_from_slice(&[b, *bytes.get(i + 1)?]);
+                i += 2;
+                continue;
+            }
+            if b == b']' {
+                in_class = false;
+            }
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' => {
+                let next = *bytes.get(i + 1)?;
+                match next {
+                    // Anchors, word boundaries and back-references are either
+                    // position-dependent or unsupported; give up on them.
+                    b'A' | b'z' | b'Z' | b'b' | b'B' | b'G' | b'K' | b'0'..=b'9' => return None,
+                    _ => {}
+                }
+                out.extend_from_slice(&[b, next]);
+                i += 2;
+                after_quantifier = false;
+                // The `{...}` of `\p{..}` is part of the class, not a repetition.
+                if (next == b'p' || next == b'P') && bytes.get(i) == Some(&b'{') {
+                    while i < bytes.len() {
+                        out.push(bytes[i]);
+                        i += 1;
+                        if bytes[i - 1] == b'}' {
+                            break;
+                        }
+                    }
+                }
+            }
+            b'[' => {
+                in_class = true;
+                out.push(b);
+                i += 1;
+                after_quantifier = false;
+            }
+            // Anchors make the alternative depend on where the haystack ends, and
+            // the fast path searches the haystack unanchored.
+            b'^' | b'$' => return None,
+            b'(' => {
+                let rest = &bytes[i..];
+                if rest.starts_with(b"(?:") {
+                    out.extend_from_slice(b"(?:");
+                    i += 3;
+                } else if rest.starts_with(b"(?") {
+                    // Inline flags, e.g. `(?i:` or `(?i)`. Anything else after
+                    // `(?` (lookaround, atomic group, named group, ...) is out.
+                    let mut j = i + 2;
+                    while matches!(
+                        bytes.get(j),
+                        Some(b'i' | b'm' | b's' | b'x' | b'u' | b'U' | b'R' | b'-')
+                    ) {
+                        j += 1;
+                    }
+                    if j > i + 2 && matches!(bytes.get(j), Some(b':' | b')')) {
+                        out.extend_from_slice(&bytes[i..=j]);
+                        i = j + 1;
+                    } else {
+                        return None;
+                    }
+                } else {
+                    // A capturing group would renumber this alternative's groups
+                    // when they are joined; not worth reasoning about.
+                    return None;
+                }
+                after_quantifier = false;
+            }
+            b'*' | b'?' => {
+                out.push(b);
+                i += 1;
+                after_quantifier = true;
+            }
+            b'+' => {
+                if after_quantifier {
+                    // Possessive marker: drop it, leaving a greedy quantifier.
+                    i += 1;
+                    after_quantifier = false;
+                } else {
+                    out.push(b);
+                    i += 1;
+                    after_quantifier = true;
+                }
+            }
+            b'{' => {
+                let end = i + bytes[i..].iter().position(|&c| c == b'}')?;
+                if !bytes[i + 1..end]
+                    .iter()
+                    .all(|&c| c.is_ascii_digit() || c == b',')
+                {
+                    return None;
+                }
+                out.extend_from_slice(&bytes[i..=end]);
+                i = end + 1;
+                after_quantifier = true;
+            }
+            b'}' => return None,
+            _ => {
+                out.push(b);
+                i += 1;
+                after_quantifier = false;
+            }
+        }
+    }
+    if in_class {
+        return None;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Yields the pieces of a text, exactly as `fancy_regex::Regex::find_iter` would.
+enum SplitPieces<'r, 't> {
+    Fancy(fancy_regex::Matches<'r, 't>),
+    Fast(FastPieces<'r, 't>),
+}
+
+impl<'t> Iterator for SplitPieces<'_, 't> {
+    type Item = fancy_regex::Result<&'t str>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            SplitPieces::Fancy(matches) => matches.next().map(|res| res.map(|mat| mat.as_str())),
+            SplitPieces::Fast(pieces) => pieces.next(),
+        }
+    }
+}
+
+/// Drives the split with one streaming `regex` search over the whole haystack,
+/// handing the positions it does not match to `fancy_regex`.
+struct FastPieces<'r, 't> {
+    text: &'t str,
+    fancy: &'r Regex,
+    fast: &'r FastRegex,
+    /// Streaming matches of `fast` over `text[base..]`.
+    matches: Option<regex::Matches<'r, 't>>,
+    base: usize,
+    /// The leftmost `fast` match at or after `pos`, once it is known.
+    pending: Option<(usize, usize)>,
+    /// Where the next piece starts.
+    pos: usize,
+    /// End of the previously yielded piece, for `find_iter`'s empty-match rule.
+    last_match: Option<usize>,
+}
+
+impl<'r, 't> FastPieces<'r, 't> {
+    fn new(text: &'t str, fancy: &'r Regex, fast: &'r FastRegex) -> FastPieces<'r, 't> {
+        FastPieces {
+            text,
+            fancy,
+            fast,
+            matches: Some(fast.find_iter(text)),
+            base: 0,
+            pending: None,
+            pos: 0,
+            last_match: None,
+        }
+    }
+
+    /// Restarts the streaming search at `pos` after the `fancy_regex` fallback
+    /// stepped over a position the fast search had already passed.
+    fn resync(&mut self) {
+        match self.pending {
+            // Still ahead of us, so still the leftmost fast match from here.
+            Some((start, _)) if start >= self.pos => return,
+            Some(_) => self.pending = None,
+            None => {}
+        }
+        if self.matches.is_some() && self.pos <= self.text.len() {
+            self.base = self.pos;
+            self.matches = Some(self.fast.find_iter(&self.text[self.pos..]));
+        }
+    }
+}
+
+impl<'t> Iterator for FastPieces<'_, 't> {
+    type Item = fancy_regex::Result<&'t str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.pos > self.text.len() {
+                return None;
+            }
+
+            // Pull matches off the streaming search until we know the leftmost one
+            // at or after `pos` (if the rest of the haystack has one at all).
+            while self.pending.is_none() {
+                let Some(matches) = self.matches.as_mut() else {
+                    break;
+                };
+                match matches.next() {
+                    Some(mat) => {
+                        let (start, end) = (self.base + mat.start(), self.base + mat.end());
+                        if start >= self.pos {
+                            self.pending = Some((start, end));
+                        }
+                    }
+                    None => self.matches = None,
+                }
+            }
+
+            if let Some((start, end)) = self.pending
+                && start == self.pos
+            {
+                // The fast alternatives match here, so the full pattern matches
+                // here with the same alternative: this is the piece.
+                self.pending = None;
+                self.pos = end;
+                self.last_match = Some(end);
+                return Some(Ok(&self.text[start..end]));
+            }
+
+            // Nothing here for the fast alternatives: let `fancy_regex` decide
+            // this position, exactly as `find_iter` does.
+            let mat = match self.fancy.find_from_pos(self.text, self.pos) {
+                Ok(Some(mat)) => mat,
+                Ok(None) => {
+                    self.pos = self.text.len() + 1;
+                    return None;
+                }
+                Err(err) => {
+                    self.pos = self.text.len() + 1;
+                    return Some(Err(err));
+                }
+            };
+            let (start, end) = (mat.start(), mat.end());
+            if start == end {
+                // Empty match: start the next search at the smallest possible
+                // position of the following match, and never report an empty
+                // match sitting where the previous match ended.
+                self.pos = end + self.text[end..].chars().next().map_or(1, |c| c.len_utf8());
+                self.resync();
+                if self.last_match == Some(end) {
+                    self.last_match = Some(end);
+                    continue;
+                }
+            } else {
+                self.pos = end;
+                self.resync();
+            }
+            self.last_match = Some(end);
+            return Some(Ok(&self.text[start..end]));
+        }
+    }
+}
+
 // Various performance notes:
 //
 // Regex
@@ -331,10 +743,23 @@ pub struct CoreBPE {
     decoder_flat: Vec<Vec<u8>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
+    // The lookaround-free leading alternatives of the split pattern, compiled as
+    // one `regex` automaton, so the split is driven by a single streaming search
+    // per document instead of one `fancy_regex` VM run per piece. `None` when the
+    // pattern is not one this can be proven equivalent for.
+    fast_split: Option<FastSplit>,
     sorted_token_bytes: Vec<Vec<u8>>,
 }
 
 impl CoreBPE {
+    /// Yields the pieces of `text`, exactly as `regex.find_iter(text)` would.
+    fn split_pieces<'a>(&'a self, text: &'a str, regex: &'a Regex) -> SplitPieces<'a, 'a> {
+        match &self.fast_split {
+            Some(fast) => SplitPieces::Fast(FastPieces::new(text, regex, &fast.regex)),
+            None => SplitPieces::Fancy(regex.find_iter(text)),
+        }
+    }
+
     fn _get_tl_regex(&self) -> &Regex {
         // See performance notes above for what this is about
         // It's also a little janky, please make a better version of it!
@@ -380,8 +805,8 @@ impl CoreBPE {
         // just make things complicated :-)
         let regex = self._get_tl_regex();
         let mut ret = vec![];
-        for mat in regex.find_iter(text) {
-            let piece = mat.unwrap().as_str().as_bytes();
+        for piece in self.split_pieces(text, regex) {
+            let piece = piece.unwrap().as_bytes();
             match self.encoder.get(piece) {
                 Some(token) => ret.push(*token),
                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
@@ -420,9 +845,9 @@ impl CoreBPE {
             let end = next_special.map_or(text.len(), |m| m.start());
 
             // Okay, here we go, compare this logic to encode_ordinary
-            for mat_res in regex.find_iter(&text[start..end]) {
-                let mat = match mat_res {
-                    Ok(m) => m,
+            for piece_res in self.split_pieces(&text[start..end], regex) {
+                let piece = match piece_res {
+                    Ok(piece) => piece,
                     Err(e) => {
                         return Err(EncodeError {
                             message: format!("Regex error while tokenizing: {e}"),
@@ -430,7 +855,7 @@ impl CoreBPE {
                     }
                 };
 
-                let piece = mat.as_str().as_bytes();
+                let piece = piece.as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
                     last_piece_token_len = 1;
                     ret.push(*token);
@@ -695,6 +1120,11 @@ impl CoreBPE {
             .map(|_| Regex::new(&special_pattern))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Derive the streaming fast splitter, but only if it is verified at
+        // construction to split exactly like `fancy_regex` does; otherwise the
+        // tokeniser keeps splitting with `find_iter` verbatim.
+        let fast_split = FastSplit::new(pattern, &regex_tls[0]);
+
         Ok(Self {
             encoder,
             special_tokens_encoder,
@@ -703,6 +1133,7 @@ impl CoreBPE {
             decoder_flat,
             regex_tls,
             special_regex_tls,
+            fast_split,
             sorted_token_bytes,
         })
     }
@@ -743,5 +1174,93 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    const R50K_PAT: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const O200K_PAT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// The shipped patterns must all take the fast path, and it must yield the
+    /// same pieces `fancy_regex` does (this is what `FastSplit::new` verifies, so
+    /// building it at all is the assertion).
+    #[test]
+    fn test_fast_split_matches_fancy_for_shipped_patterns() {
+        for pattern in [R50K_PAT, CL100K_PAT, O200K_PAT] {
+            let fancy = Regex::new(pattern).unwrap();
+            assert!(
+                crate::FastSplit::new(pattern, &fancy).is_some(),
+                "fast split rejected for {pattern}"
+            );
+        }
+    }
+
+    /// Longer, more varied texts than the construction-time corpus, checked piece
+    /// for piece against `fancy_regex`.
+    #[test]
+    fn test_fast_split_matches_fancy_on_texts() {
+        let texts = [
+            "The quick brown fox jumps over the lazy dog.",
+            "It's a test, isn't it? 42 apples\n\nand 1,000 oranges.",
+            "  multiple   spaces\tand\ttabs  ",
+            "windows\r\nnewlines\r\n\r\nand trailing\r\n",
+            "ЖЖ ЖЖ 漢字テスト ١٢٣ Ⅻ",
+            "emoji 🙂🙃 combining a\u{0301}e\u{0301} nbsp\u{a0}x",
+            "'s 'T 've'll'd '",
+            "12345 678 9 0x1F",
+            "",
+            " ",
+            "\n",
+            "a",
+        ];
+        for pattern in [R50K_PAT, CL100K_PAT, O200K_PAT] {
+            let fancy = Regex::new(pattern).unwrap();
+            let fast = crate::FastSplit::new(pattern, &fancy).unwrap();
+            for text in texts {
+                let expected: Vec<&str> = fancy
+                    .find_iter(text)
+                    .map(|res| res.unwrap().as_str())
+                    .collect();
+                let actual: Vec<&str> = crate::FastPieces::new(text, &fancy, &fast.regex)
+                    .map(|res| res.unwrap())
+                    .collect();
+                assert_eq!(expected, actual, "pattern {pattern} text {text:?}");
+            }
+        }
+    }
+
+    /// Patterns whose first alternative needs `fancy_regex` keep the old path.
+    #[test]
+    fn test_fast_split_refuses_unsupported_patterns() {
+        for pattern in [r"(?=a)b|c", r"\ba+|b", r"(a)\1|b", r"a\G|b", r"^a|b"] {
+            let fancy = Regex::new(pattern).unwrap();
+            assert!(
+                crate::FastSplit::new(pattern, &fancy).is_none(),
+                "fast split accepted for {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_possessive_markers_are_dropped_carefully() {
+        assert_eq!(
+            crate::regex_crate_alternative(r" ?\p{L}++").as_deref(),
+            Some(r" ?\p{L}+")
+        );
+        assert_eq!(
+            crate::regex_crate_alternative(r"[^\r\n\p{L}\p{N}]?+\p{L}++").as_deref(),
+            Some(r"[^\r\n\p{L}\p{N}]?\p{L}+")
+        );
+        assert_eq!(
+            crate::regex_crate_alternative(r"\p{N}{1,3}+").as_deref(),
+            Some(r"\p{N}{1,3}")
+        );
+        // `\++` is one-or-more literal `+`, not a possessive marker.
+        assert_eq!(
+            crate::regex_crate_alternative(r"\++").as_deref(),
+            Some(r"\++")
+        );
+        assert_eq!(crate::regex_crate_alternative(r"\s++$"), None);
+        assert_eq!(crate::regex_crate_alternative(r"\s+(?!\S)"), None);
     }
 }
