@@ -168,7 +168,16 @@ impl CoreBPE {
         // overlap here.
         if let Ok(list) = tokens.downcast::<PyList>() {
             // Resolve every token to its byte slice and accumulate total length.
-            let mut slices: Vec<&[u8]> = Vec::with_capacity(list.len());
+            //
+            // The buffer is allocated once with room for every token, and the
+            // resolved slices are written through a cursor over its spare
+            // capacity: `Vec::push` would re-check the capacity (and reload the
+            // vector's fields, since `read_rank` can call back into CPython) on
+            // every one of the millions of tokens a large decode walks.
+            let capacity = list.len();
+            let mut slices: Vec<&[u8]> = Vec::with_capacity(capacity);
+            let mut cursor = slices.as_mut_ptr();
+            let mut resolved = 0usize;
             let mut total_len = 0usize;
             for item in list.iter() {
                 let token = read_rank(&item)?;
@@ -178,13 +187,42 @@ impl CoreBPE {
                     ))
                 })?;
                 total_len += token_bytes.len();
-                slices.push(token_bytes);
+                // SAFETY: `slices` was allocated with `capacity` elements and
+                // `PyList`'s iterator yields at most the number of items the
+                // list held when the iterator was created, i.e. `capacity`, so
+                // this writes at most `capacity` elements into the spare
+                // capacity. The length is only published once the loop is done;
+                // an early return leaves `slices` empty, and `&[u8]` needs no
+                // drop, so nothing is leaked.
+                unsafe {
+                    cursor.write(token_bytes);
+                    cursor = cursor.add(1);
+                }
+                resolved += 1;
             }
+            // SAFETY: `resolved` elements were initialised above.
+            unsafe { slices.set_len(resolved) };
             // Copy the resolved bytes directly into the final buffer.
-            let bytes = PyBytes::new_with(py, total_len, |mut buf| {
+            //
+            // The buffer is sized to exactly the sum of the slice lengths, so
+            // walk it with a single cursor instead of re-slicing it per token:
+            // `buf[..len]` and `&mut buf[len..]` each bounds-check offsets that
+            // are already known to be in range, and `copy_from_slice` re-checks
+            // that the two lengths match. That is pure per-token overhead in a
+            // loop that runs once per decoded token.
+            let bytes = PyBytes::new_with(py, total_len, |buf| {
+                let mut out = buf.as_mut_ptr();
                 for s in &slices {
-                    buf[..s.len()].copy_from_slice(s);
-                    buf = &mut buf[s.len()..];
+                    // SAFETY: `total_len` is the exact sum of the lengths of
+                    // the slices in `slices`, so the cursor advances by exactly
+                    // `buf.len()` over the whole loop and every write stays
+                    // inside the buffer. `buf` points into a freshly allocated
+                    // `bytes` object, which cannot overlap the vocabulary
+                    // storage the slices borrow from.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(s.as_ptr(), out, s.len());
+                        out = out.add(s.len());
+                    }
                 }
                 Ok(())
             })?;
