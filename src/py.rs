@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use pyo3::{
-    IntoPyObjectExt, PyResult, exceptions,
+    IntoPyObjectExt, PyResult,
+    buffer::{Element, PyBuffer, PyUntypedBuffer},
+    exceptions,
     prelude::*,
     pybacked::PyBackedStr,
     types::{PyBytes, PyList},
@@ -191,6 +193,17 @@ impl CoreBPE {
             return Ok(bytes.into());
         }
 
+        // Fast path for token ids that live in a contiguous integer buffer:
+        // `numpy` arrays, torch CPU tensors, `array.array`, `memoryview`. The
+        // generic path below reaches those through the sequence protocol, which
+        // materialises (and immediately throws away) one Python `int` per token;
+        // here the ids are read straight out of the buffer instead.
+        if unsafe { pyo3::ffi::PyObject_CheckBuffer(tokens.as_ptr()) } == 1
+            && let Some(result) = self.decode_int_buffer(py, tokens)
+        {
+            return result;
+        }
+
         // Non-`list` inputs keep the original generic extraction path.
         let tokens: Vec<Rank> = tokens.extract()?;
         match py.detach(|| self.decode_bytes(&tokens)) {
@@ -218,6 +231,85 @@ impl CoreBPE {
             .iter()
             .map(|x| PyBytes::new(py, x).into())
             .collect()
+    }
+}
+
+impl CoreBPE {
+    /// Decodes token ids read directly out of a one-dimensional, C-contiguous
+    /// buffer of fixed-width integers (`numpy` arrays, torch CPU tensors,
+    /// `array.array`, `memoryview`).
+    ///
+    /// Returns `None` when `tokens` is not such a buffer, or when one of its
+    /// values does not fit a token id, so the caller falls back to the generic
+    /// extraction path and its exact error behaviour is preserved.
+    fn decode_int_buffer(
+        &self,
+        py: Python<'_>,
+        tokens: &Bound<'_, PyAny>,
+    ) -> Option<Result<Py<PyBytes>, PyErr>> {
+        let buffer = PyUntypedBuffer::get(tokens).ok()?;
+        if buffer.dimensions() > 1 {
+            return None;
+        }
+        // The widths token ids actually arrive in: `uint32` (what
+        // `encode_to_numpy` produces) and the 32/64-bit signed and unsigned
+        // integers `numpy`/torch default to. Anything else falls back.
+        if let Ok(buffer) = buffer.as_typed::<u32>() {
+            self.decode_from_buffer(py, buffer)
+        } else if let Ok(buffer) = buffer.as_typed::<i64>() {
+            self.decode_from_buffer(py, buffer)
+        } else if let Ok(buffer) = buffer.as_typed::<i32>() {
+            self.decode_from_buffer(py, buffer)
+        } else if let Ok(buffer) = buffer.as_typed::<u64>() {
+            self.decode_from_buffer(py, buffer)
+        } else {
+            None
+        }
+    }
+
+    /// Resolves the token ids in `buffer` and copies their bytes into a Python
+    /// `bytes` object, mirroring the `list` fast path in `py_decode_bytes`.
+    fn decode_from_buffer<T>(
+        &self,
+        py: Python<'_>,
+        buffer: &PyBuffer<T>,
+    ) -> Option<Result<Py<PyBytes>, PyErr>>
+    where
+        T: Element + Copy,
+        Rank: TryFrom<T>,
+    {
+        // `None` unless the buffer is C-contiguous, in which case the ids are a
+        // plain slice of integers: no per-token Python object is involved.
+        let items = buffer.as_slice(py)?;
+
+        let mut slices: Vec<&[u8]> = Vec::with_capacity(items.len());
+        let mut total_len = 0usize;
+        for item in items {
+            // Out-of-range values (negative, or wider than a token id) fall back
+            // to the generic path, which raises the original `OverflowError`.
+            let token = Rank::try_from(item.get()).ok()?;
+            let token_bytes = match self.token_bytes(token) {
+                Some(token_bytes) => token_bytes,
+                None => {
+                    return Some(Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                        "Invalid token for decoding: {token}"
+                    ))));
+                }
+            };
+            total_len += token_bytes.len();
+            slices.push(token_bytes);
+        }
+
+        Some(
+            PyBytes::new_with(py, total_len, |mut buf| {
+                for s in &slices {
+                    buf[..s.len()].copy_from_slice(s);
+                    buf = &mut buf[s.len()..];
+                }
+                Ok(())
+            })
+            .map(Into::into),
+        )
     }
 }
 

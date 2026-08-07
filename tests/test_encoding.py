@@ -1,5 +1,6 @@
 # Note that there are more actual tests, they're just not currently public :-)
 
+import array
 from typing import Callable
 
 import hypothesis
@@ -144,6 +145,30 @@ def test_basic_roundtrip(make_enc):
     ):
         assert value == enc.decode(enc.encode(value))
         assert value == enc.decode(enc.encode_ordinary(value))
+
+
+@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
+def test_decode_from_buffer(make_enc: Callable[[], tiktoken.Encoding]):
+    # `decode` takes any `Sequence[int]`, including the contiguous integer
+    # buffers that model outputs come in (numpy arrays, torch CPU tensors,
+    # `array.array`, `memoryview`). Those must decode exactly like a `list`,
+    # whatever the integer width, and keep their original errors.
+    enc = make_enc()
+    tokens = enc.encode_ordinary("hello world, 请考试我的软件！12345")
+    expected = enc.decode(tokens)
+
+    for typecode in ("I", "i", "q", "Q", "l", "L"):
+        buffer = array.array(typecode, tokens)
+        assert enc.decode(buffer) == expected
+        assert enc.decode(memoryview(buffer)) == expected
+        # Non-contiguous views are not read directly, but must still decode.
+        assert enc.decode(memoryview(buffer)[::2]) == enc.decode(tokens[::2])
+        assert enc.decode(array.array(typecode, [])) == ""
+
+    with pytest.raises(OverflowError):
+        enc.decode(array.array("i", [-1]))
+    with pytest.raises(KeyError):
+        enc.decode(array.array("I", [enc.max_token_value + 1]))
 
 
 @pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)

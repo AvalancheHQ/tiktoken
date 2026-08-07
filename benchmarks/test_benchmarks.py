@@ -13,6 +13,7 @@ measurement.
 
 from __future__ import annotations
 
+import array
 import functools
 
 import pytest
@@ -78,6 +79,26 @@ def test_encode(benchmark, encoding_name: str, size: str) -> None:
 def test_decode(benchmark, encoding_name: str, size: str) -> None:
     enc = _get_encoding(encoding_name)
     tokens = enc.encode_ordinary(TEXT_SIZES[size])
+    text = benchmark(enc.decode, tokens)
+    assert text
+
+
+# Token ids very often reach `decode` inside a contiguous integer buffer rather
+# than a Python `list`: model outputs are `numpy` arrays or torch CPU tensors,
+# and `Encoding.encode_to_numpy` hands back `uint32`. `decode` documents its
+# argument as `Sequence[int]`, so all of these are valid inputs. `array.array`
+# is the standard-library stand-in for that shape (no extra dependency): `"I"`
+# is what `encode_to_numpy` produces, `"q"` is the 64-bit width `numpy`/torch
+# default to.
+BUFFER_TYPECODES = ["I", "q"]
+
+
+@pytest.mark.parametrize("encoding_name", ENCODING_NAMES)
+@pytest.mark.parametrize("typecode", BUFFER_TYPECODES)
+@pytest.mark.parametrize("size", ["medium", "large"])
+def test_decode_buffer(benchmark, encoding_name: str, typecode: str, size: str) -> None:
+    enc = _get_encoding(encoding_name)
+    tokens = array.array(typecode, enc.encode_ordinary(TEXT_SIZES[size]))
     text = benchmark(enc.decode, tokens)
     assert text
 
