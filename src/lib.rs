@@ -315,6 +315,107 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+// The tokeniser split, not the BPE merges, dominates encoding: ~86% of
+// `encode_ordinary` sits under `fancy_regex`. The patterns OpenAI ships contain
+// one lookaround (`\s+(?!\S)`), so `fancy_regex` runs the *whole* alternation on
+// its backtracking VM, once per piece. Worse, every alternative marks each of
+// its quantifiers possessive on its own (`\p{L}++`, `[^\r\n\p{L}\p{N}]?+`, …).
+// A possessive quantifier is an atomic group, which `fancy_regex` treats as a
+// "fancy" construct, so no alternative can be handed to `regex-automata` as a
+// whole: each one is compiled into VM instructions with `BeginAtomic`/`EndAtomic`
+// save/restore bookkeeping around one delegated automaton search *per quantifier*.
+//
+// The alternations below are equivalent rewrites in which
+//
+//   * the possessive markers are dropped, and
+//   * the leading run of alternatives that contain no lookaround is nested in a
+//     single non-capturing group,
+//
+// so `fancy_regex` compiles that whole run into **one** `Delegate` instruction:
+// one automaton search per piece instead of one per alternative-and-quantifier,
+// with the automaton resolving the ordered alternation internally (the `regex`
+// crate is leftmost-first, exactly like the alternation it replaces).
+//
+// Dropping the possessive markers cannot change what is matched here: every
+// quantifier they guard is either at the end of its alternative, or is followed
+// only by something that matches empty (`[\r\n]*`) or by an end-of-text anchor.
+// In each case nothing after the quantifier can fail and force it to give back
+// characters, so greedy and possessive accept exactly the same piece at every
+// position.
+//
+// This is applied conservatively: only to the exact patterns below, and only
+// after `verify_equivalent_split` confirms at construction that the rewrite
+// splits a corpus byte-for-byte like the pattern the caller passed in.
+const R50K_PAT: &str =
+    r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+const R50K_PAT_GROUPED: &str =
+    r"(?:'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+$)|\s+(?!\S)|\s";
+const CL100K_PAT: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+const CL100K_PAT_GROUPED: &str = r"(?:'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s+$|\s*[\r\n])|\s+(?!\S)|\s";
+
+/// Corpus used to check that a rewritten split pattern behaves exactly like the
+/// original. It covers every character class the shipped patterns distinguish:
+/// contractions, letters and digits (ASCII and not), punctuation, and every
+/// arrangement of spaces, tabs and line breaks, including at the end of the text.
+const SPLIT_CHECK_CORPUS: &[&str] = &[
+    "",
+    " ",
+    "  ",
+    "\n",
+    "\r\n",
+    " \n ",
+    "\t\t x",
+    "hello world",
+    "Hello, world! It's 2024; 1234567 items.",
+    "don't can't we'll they've I'm he'd  IT'S",
+    " leading and trailing  ",
+    "line one\nline two\r\n\r\nline three\n",
+    "tabs\tand \t spaces \t\n mixed\n\n\n",
+    "no_trailing_space_at_end",
+    "trailing whitespace run   ",
+    "trailing newline run \n\n",
+    "punctuation!!!???...---***(((",
+    "mixed123abc456 789def 0",
+    "Ünïcödé wörds with áccents and 数字 １２３ and emoji 🙂🙂 end",
+    "«quotes» — dashes… ellipsis",
+    "a  b   c    d",
+    "\u{a0}nbsp and \u{2003}em space",
+];
+
+/// Returns an equivalent, cheaper-to-run form of `pattern`, or `None` when the
+/// pattern is not one we know how to rewrite.
+fn grouped_split_pattern(pattern: &str) -> Option<&'static str> {
+    match pattern {
+        R50K_PAT => Some(R50K_PAT_GROUPED),
+        CL100K_PAT => Some(CL100K_PAT_GROUPED),
+        _ => None,
+    }
+}
+
+/// Checks that `candidate` splits [`SPLIT_CHECK_CORPUS`] exactly like `original`.
+fn verify_equivalent_split(original: &Regex, candidate: &Regex) -> bool {
+    for text in SPLIT_CHECK_CORPUS {
+        let mut expected = Vec::new();
+        for mat in original.find_iter(text) {
+            match mat {
+                Ok(m) => expected.push((m.start(), m.end())),
+                Err(_) => return false,
+            }
+        }
+        let mut actual = Vec::new();
+        for mat in candidate.find_iter(text) {
+            match mat {
+                Ok(m) => actual.push((m.start(), m.end())),
+                Err(_) => return false,
+            }
+        }
+        if expected != actual {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -683,13 +784,28 @@ impl CoreBPE {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
+        // Split with an equivalent, regrouped form of the pattern when we have one
+        // (see the notes next to `grouped_split_pattern`). The rewrite is only
+        // adopted after it is verified, here, to split exactly like the pattern we
+        // were given; otherwise the original is used verbatim.
+        let split_pattern = match grouped_split_pattern(pattern) {
+            Some(grouped) => {
+                let original = Regex::new(pattern)?;
+                match Regex::new(grouped) {
+                    Ok(candidate) if verify_equivalent_split(&original, &candidate) => grouped,
+                    _ => pattern,
+                }
+            }
+            None => pattern,
+        };
+
         // Compile an independent regex per thread-local slot instead of cloning one. Cloning a
         // `fancy_regex::Regex` shares an `Arc<Prog>` whose regex-automata engines keep their scratch
         // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
         // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
         // lock-free path), paying the compile cost once at construction rather than on the hot path.
         let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
+            .map(|_| Regex::new(split_pattern))
             .collect::<Result<Vec<_>, _>>()?;
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
