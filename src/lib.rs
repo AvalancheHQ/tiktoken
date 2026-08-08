@@ -315,6 +315,54 @@ impl std::error::Error for EncodeError {}
 
 const MAX_NUM_THREADS: usize = 128;
 
+/// The split patterns tiktoken ships mark **every** quantifier of an
+/// alternative possessive (`\p{L}++`, `[^\r\n\p{L}\p{N}]?+`, `\p{N}{1,3}+`,
+/// `[\r\n]*+`, `\s++$`).
+///
+/// A possessive quantifier is an atomic group, which `fancy_regex` classifies
+/// as a "fancy" construct. That has a large cost on the split hot path: an
+/// alternative containing one cannot be handed to the `regex` automaton as a
+/// whole, so it is compiled into backtracking-VM instructions with a
+/// `BeginAtomic`/`EndAtomic` save/restore frame *per quantifier* and one
+/// anchored automaton search per lookaround-free fragment in between. The VM
+/// runs once per piece, so that bookkeeping is paid for every token.
+///
+/// The markers are redundant in these patterns: greedy and possessive accept
+/// exactly the same piece at every position, because no backtrack can ever
+/// succeed.
+///
+/// * `\p{L}++`, `\p{N}++`, `\p{N}{1,3}+`, `[^\s\p{L}\p{N}]++[\r\n]*+`: nothing
+///   after the quantifier can fail, since it is either the end of the
+///   alternative or a quantifier that also matches empty. The greedy attempt
+///   therefore succeeds outright and never backtracks.
+/// * `\s++$`: giving characters back only moves the end *earlier* in the text,
+///   and `$` (end of text, these patterns are not multi-line) can only hold at
+///   the very end, so every shorter attempt fails just like the possessive one.
+/// * `[^\r\n\p{L}\p{N}]?+\p{L}++`: giving back the optional leading character
+///   would require `\p{L}+` to match it, but the two classes are disjoint by
+///   construction, so that backtrack can never succeed either.
+///
+/// Rewriting is deliberately keyed on the exact patterns tiktoken ships: this
+/// is an equivalence argument about *these* patterns, not a general rule about
+/// possessive quantifiers. Any other pattern (including `o200k_base`, which
+/// uses no possessive quantifiers) is compiled verbatim.
+fn relax_split_pattern(pattern: &str) -> &str {
+    // gpt2 / r50k_base / p50k_base / p50k_edit
+    const R50K: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s";
+    const R50K_RELAXED: &str =
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+$|\s+(?!\S)|\s";
+    // cl100k_base
+    const CL100K: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s";
+    const CL100K_RELAXED: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s+$|\s*[\r\n]|\s+(?!\S)|\s";
+
+    match pattern {
+        R50K => R50K_RELAXED,
+        CL100K => CL100K_RELAXED,
+        other => other,
+    }
+}
+
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
@@ -688,8 +736,13 @@ impl CoreBPE {
         // in a single mutex-guarded `Pool`, so cloned slots contend on that pool's slow path during
         // multi-threaded batch encoding. Compiling per slot gives each thread its own pool (fast,
         // lock-free path), paying the compile cost once at construction rather than on the hot path.
+        //
+        // The pattern itself is first relaxed to the equivalent form without
+        // possessive quantifiers, so `fancy_regex` can delegate whole
+        // alternatives to the `regex` automaton (see `relax_split_pattern`).
+        let split_pattern = relax_split_pattern(pattern);
         let regex_tls = (0..MAX_NUM_THREADS)
-            .map(|_| Regex::new(pattern))
+            .map(|_| Regex::new(split_pattern))
             .collect::<Result<Vec<_>, _>>()?;
         let special_regex_tls = (0..MAX_NUM_THREADS)
             .map(|_| Regex::new(&special_pattern))
@@ -725,7 +778,7 @@ mod tests {
     use fancy_regex::Regex;
     use rustc_hash::FxHashMap as HashMap;
 
-    use crate::{Rank, byte_pair_split};
+    use crate::{Rank, byte_pair_split, relax_split_pattern};
 
     fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
         HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
@@ -743,5 +796,82 @@ mod tests {
         let ranks = setup_ranks();
         let res = byte_pair_split(b"abab", &ranks);
         assert_eq!(res, vec![b"ab", b"ab"]);
+    }
+
+    /// The relaxed (non-possessive) split patterns must produce byte-identical
+    /// pieces to the patterns tiktoken ships, otherwise tokenisation changes.
+    #[test]
+    fn test_relaxed_split_pattern_matches_shipped_pattern() {
+        let shipped = [
+            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s",
+            r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s",
+        ];
+
+        // Alphabet chosen to exercise every alternative and the boundaries
+        // between them: contractions, letters, digits, symbols, every kind of
+        // whitespace run, and non-ASCII (accents, combining marks, CJK, emoji,
+        // NBSP, Arabic-Indic digits).
+        let alphabet = [
+            "a",
+            "Z",
+            "'",
+            "'s",
+            "'ll",
+            "0",
+            "42",
+            "1234",
+            " ",
+            "  ",
+            "\t",
+            "\n",
+            "\r\n",
+            "\r",
+            ".",
+            "-",
+            "!",
+            "é",
+            "e\u{0301}",
+            "中",
+            "🙂",
+            "\u{00a0}",
+            "\u{0660}",
+            "\u{2028}",
+        ];
+
+        let mut texts: Vec<String> = alphabet.iter().map(|s| s.to_string()).collect();
+        for a in alphabet {
+            for b in alphabet {
+                texts.push(format!("{a}{b}"));
+                for c in alphabet {
+                    texts.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+        texts.push("The quick brown fox jumps over the lazy dog.\n\n  It's 42!".to_string());
+
+        for pattern in shipped {
+            let relaxed = relax_split_pattern(pattern);
+            assert_ne!(relaxed, pattern, "pattern should have been relaxed");
+            let original = Regex::new(pattern).unwrap();
+            let rewritten = Regex::new(relaxed).unwrap();
+            for text in &texts {
+                let expected: Vec<&str> = original
+                    .find_iter(text)
+                    .map(|m| m.unwrap().as_str())
+                    .collect();
+                let actual: Vec<&str> = rewritten
+                    .find_iter(text)
+                    .map(|m| m.unwrap().as_str())
+                    .collect();
+                assert_eq!(actual, expected, "split diverged for {text:?}");
+            }
+        }
+    }
+
+    /// Unknown patterns must be compiled verbatim.
+    #[test]
+    fn test_unknown_split_pattern_is_untouched() {
+        let pattern = r"'(?:[sdmt])| ?\p{L}++|\s";
+        assert_eq!(relax_split_pattern(pattern), pattern);
     }
 }
