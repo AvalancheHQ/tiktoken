@@ -430,10 +430,13 @@ class Encoding:
 
 @functools.lru_cache(maxsize=128)
 def _special_token_regex(tokens: frozenset[str]) -> re.Pattern[str]:
-    try:
-        import regex as re
-    except ImportError:
-        import re
+    # This matcher only ever runs an alternation of escaped *literals*, so the
+    # third-party `regex` module buys nothing here, while its per-call
+    # machinery is markedly more expensive than the stdlib engine's. Every
+    # `encode` call pays that cost once (to reject disallowed special tokens),
+    # which makes it a visible share of short-input encoding.
+    import re
+
     inner = "|".join(re.escape(token) for token in tokens)
     return re.compile(f"({inner})")
 
