@@ -18,6 +18,13 @@ impl CoreBPE {
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> PyResult<Self> {
+        // The vocabulary is only ever read, so store each token's bytes as a
+        // boxed slice: `Vec<u8>`'s capacity word is dead weight in the table.
+        // pyo3 hands us exactly-sized `Vec`s, so this does not reallocate.
+        let encoder = encoder
+            .into_iter()
+            .map(|(bytes, rank)| (bytes.into_boxed_slice(), rank))
+            .collect();
         Self::new_internal(encoder, special_tokens_encoder, pattern)
             .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))
     }
@@ -101,7 +108,7 @@ impl CoreBPE {
                     }
 
                     if !unstable_bytes.is_empty() {
-                        match self.encoder.get(&unstable_bytes) {
+                        match self.encoder.get(unstable_bytes.as_slice()) {
                             Some(token) => tokens.push(*token),
                             None => {
                                 tokens.extend(&byte_pair_encode(&unstable_bytes, &self.encoder))

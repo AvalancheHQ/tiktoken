@@ -1,4 +1,6 @@
+use std::borrow::Borrow;
 use std::collections::HashSet;
+use std::hash::Hash;
 use std::num::NonZeroU64;
 use std::thread;
 
@@ -44,7 +46,10 @@ struct State {
     cur_rank: Rank,
 }
 
-fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<Rank> {
+fn _byte_pair_merge_large<K: Borrow<[u8]> + Eq + Hash>(
+    ranks: &HashMap<K, Rank>,
+    piece: &[u8],
+) -> Vec<Rank> {
     let mut state = Vec::with_capacity(piece.len());
     state.push(State {
         prev: usize::MAX,
@@ -137,7 +142,10 @@ fn _byte_pair_merge_large(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<R
     result
 }
 
-fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
+fn _byte_pair_merge<K: Borrow<[u8]> + Eq + Hash>(
+    ranks: &HashMap<K, Rank>,
+    piece: &[u8],
+) -> Vec<(usize, Rank)> {
     // This is a vector of (start, rank).
     // The rank is of the pair starting at position start.
     let mut parts = Vec::with_capacity(piece.len() + 1);
@@ -195,7 +203,10 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
     parts
 }
 
-pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+pub fn byte_pair_encode<K: Borrow<[u8]> + Eq + Hash>(
+    piece: &[u8],
+    ranks: &HashMap<K, Rank>,
+) -> Vec<Rank> {
     let piece_len = piece.len();
 
     if piece_len == 1 {
@@ -210,7 +221,10 @@ pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Ran
     _byte_pair_merge_large(ranks, piece)
 }
 
-pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<&'a [u8]> {
+pub fn byte_pair_split<'a, K: Borrow<[u8]> + Eq + Hash>(
+    piece: &'a [u8],
+    ranks: &HashMap<K, Rank>,
+) -> Vec<&'a [u8]> {
     assert!(piece.len() > 1);
     _byte_pair_merge(ranks, piece)
         .windows(2)
@@ -318,20 +332,26 @@ const MAX_NUM_THREADS: usize = 128;
 #[cfg_attr(feature = "python", pyclass(frozen))]
 #[derive(Clone)]
 pub struct CoreBPE {
-    encoder: HashMap<Vec<u8>, Rank>,
+    encoder: HashMap<Box<[u8]>, Rank>,
     special_tokens_encoder: HashMap<String, Rank>,
-    decoder: HashMap<Rank, Vec<u8>>,
-    special_tokens_decoder: HashMap<Rank, Vec<u8>>,
+    decoder: HashMap<Rank, Box<[u8]>>,
+    special_tokens_decoder: HashMap<Rank, Box<[u8]>>,
     // Flat, rank-indexed view of every token's bytes (regular + special). Token
     // ranks are dense (`0..=max_rank`), so decoding can resolve a token with a
     // single bounds-checked slice index instead of hashing into `decoder` and
     // then falling back to `special_tokens_decoder`. `decode` is the hottest
     // consumer of this and is dominated by per-token lookups, so replacing the
     // hash lookup with a direct index is a measurable win.
-    decoder_flat: Vec<Vec<u8>>,
+    //
+    // The entries are `Box<[u8]>` rather than `Vec<u8>`: the table is only ever
+    // read, so the spare capacity field is dead weight, and dropping it takes an
+    // entry from 24 to 16 bytes. That fits four entries per cache line instead
+    // of two and a half, which matters because `decode` indexes this table once
+    // per token at essentially random offsets.
+    decoder_flat: Vec<Box<[u8]>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
-    sorted_token_bytes: Vec<Vec<u8>>,
+    sorted_token_bytes: Vec<Box<[u8]>>,
 }
 
 impl CoreBPE {
@@ -358,7 +378,7 @@ impl CoreBPE {
         // none for well-formed vocabularies, but we stay defensive), which we
         // treat as a miss.
         match self.decoder_flat.get(token as usize) {
-            Some(bytes) if !bytes.is_empty() => Some(bytes.as_slice()),
+            Some(bytes) if !bytes.is_empty() => Some(bytes),
             _ => None,
         }
     }
@@ -531,13 +551,11 @@ impl CoreBPE {
         // Separating this from the loop below helps with performance in a common case.
         let mut point = self
             .sorted_token_bytes
-            .partition_point(|x| x.as_slice() < unstable_bytes.as_slice());
+            .partition_point(|x| x.as_ref() < unstable_bytes.as_slice());
         while point < self.sorted_token_bytes.len()
             && self.sorted_token_bytes[point].starts_with(&unstable_bytes)
         {
-            completions.insert(vec![
-                self.encoder[self.sorted_token_bytes[point].as_slice()],
-            ]);
+            completions.insert(vec![self.encoder[self.sorted_token_bytes[point].as_ref()]]);
             point += 1;
         }
 
@@ -549,12 +567,12 @@ impl CoreBPE {
             let suffix = &unstable_bytes[i..];
             let mut point = self
                 .sorted_token_bytes
-                .partition_point(|x| x.as_slice() < suffix);
+                .partition_point(|x| x.as_ref() < suffix);
             // TODO: Perf optimisation if suffix starts with " "?
             while point < self.sorted_token_bytes.len()
                 && self.sorted_token_bytes[point].starts_with(suffix)
             {
-                let possibility = [prefix, self.sorted_token_bytes[point].as_slice()].concat();
+                let possibility = [prefix, self.sorted_token_bytes[point].as_ref()].concat();
                 let encoded = match std::str::from_utf8(&possibility) {
                     // Morally, this is byte_pair_encode(&possibility, &self.encoder)
                     // But we might have introduced a regex split which would prevent merges.
@@ -627,14 +645,17 @@ impl CoreBPE {
         NSE: IntoIterator<Item = (String, (Rank, Rank))>,
     {
         Self::new_internal(
-            HashMap::from_iter(encoder),
+            encoder
+                .into_iter()
+                .map(|(bytes, rank)| (bytes.into_boxed_slice(), rank))
+                .collect(),
             HashMap::from_iter(special_tokens_encoder),
             pattern,
         )
     }
 
     fn new_internal(
-        encoder: HashMap<Vec<u8>, Rank>,
+        encoder: HashMap<Box<[u8]>, Rank>,
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -644,7 +665,7 @@ impl CoreBPE {
             .collect::<Vec<_>>()
             .join("|");
 
-        let decoder: HashMap<Rank, Vec<u8>> =
+        let decoder: HashMap<Rank, Box<[u8]>> =
             encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
 
         assert!(
@@ -654,9 +675,9 @@ impl CoreBPE {
             decoder.len()
         );
 
-        let special_tokens_decoder: HashMap<Rank, Vec<u8>> = special_tokens_encoder
+        let special_tokens_decoder: HashMap<Rank, Box<[u8]>> = special_tokens_encoder
             .iter()
-            .map(|(k, v)| (*v, k.as_bytes().to_vec()))
+            .map(|(k, v)| (*v, Box::from(k.as_bytes())))
             .collect();
 
         // Build a flat, rank-indexed decode table. Token ranks are dense, so
@@ -668,9 +689,9 @@ impl CoreBPE {
             .chain(special_tokens_decoder.keys())
             .copied()
             .max();
-        let decoder_flat: Vec<Vec<u8>> = match max_rank {
+        let decoder_flat: Vec<Box<[u8]>> = match max_rank {
             Some(max_rank) => {
-                let mut flat = vec![Vec::new(); max_rank as usize + 1];
+                let mut flat: Vec<Box<[u8]>> = vec![Box::default(); max_rank as usize + 1];
                 for (&rank, bytes) in decoder.iter().chain(special_tokens_decoder.iter()) {
                     flat[rank as usize] = bytes.clone();
                 }
@@ -680,7 +701,7 @@ impl CoreBPE {
         };
 
         // Clone because I don't know how to tell Rust I'm not going to change the map
-        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
+        let mut sorted_token_bytes: Vec<Box<[u8]>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
         // Compile an independent regex per thread-local slot instead of cloning one. Cloning a
@@ -727,8 +748,11 @@ mod tests {
 
     use crate::{Rank, byte_pair_split};
 
-    fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
-        HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
+    fn setup_ranks() -> HashMap<Box<[u8]>, Rank> {
+        HashMap::from_iter([
+            (Box::from(b"ab".as_slice()), 0),
+            (Box::from(b"cd".as_slice()), 1),
+        ])
     }
 
     #[test]
